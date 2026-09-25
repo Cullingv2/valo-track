@@ -1661,6 +1661,21 @@ async function main() {
   if (!TAURI && new URLSearchParams(location.search).has("intro")) playIntro();
   else transition();
 
+  // Aperçu navigateur (captures d'écran) : ?open=career ou ?open=match ouvre directement la vue
+  const open = !TAURI && new URLSearchParams(location.search).get("open");
+  if (open) {
+    const first = currentSnap()?.players.find((p) => p.isMe) || currentSnap()?.players[0];
+    if (first) openCareer(first.puuid);
+    if (open === "match") {
+      const wait = setInterval(() => {
+        const id = app.view?.data?.done && app.view.data.matches[0]?.matchId;
+        if (!id) return;
+        clearInterval(wait);
+        openMatch(id);
+      }, 200);
+    }
+  }
+
   // Démarrage de l'application (après l'avoir quittée) : la fenêtre s'ouvre sur l'intro.
   if (TAURI && introMode() === "launch") {
     app.launchIntro = true;
