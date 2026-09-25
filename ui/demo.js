@@ -10,7 +10,8 @@ window.DEMO = {
   },
 
   _maps(assets) {
-    return [...(assets?.maps.entries() || [])].filter(([url, m]) => m.strip && !/range|npev2|duel|hurm|abilitydraft/i.test(url));
+    // Cartes de compétition seulement (les cartes sont aussi indexées par identifiant : on ne garde que les chemins)
+    return [...(assets?.maps.entries() || [])].filter(([url, m]) => m.strip && url.startsWith("/game/maps/") && !/range|npev2|duel|hurm|abilitydraft|plummet/i.test(url));
   },
 
   /** Recherche fictive par Riot ID (« inconnu#… » = introuvable). */
