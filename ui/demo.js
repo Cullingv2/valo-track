@@ -127,12 +127,64 @@ window.DEMO = {
 
   async match(assets, id, perspective) {
     await new Promise((r) => setTimeout(r, 600));
+    return this._match(assets, id, perspective);
+  },
+
+  /** Écran de fin de partie fictif (toi = « Nova », distinction et MVP). */
+  result(assets, snap) {
+    const me = snap?.players.find((p) => p.isMe) || { puuid: "demo-a0", agentId: null };
+    if (this._result?.puuid === me.puuid) return this._result;
+    const d = this._match(assets, "demo-result", me.puuid, { win: true });
+    const players = d.teams.flatMap((t) => t.players);
+    const line = players.find((p) => p.puuid === me.puuid);
+    // Toi en tête du match (MVP) : les autres restent sous ton score
+    for (const p of players) Object.assign(p, { mvp: false, acs: Math.min(p.acs, 296) });
+    const total = d.rounds.length;
+    Object.assign(line, {
+      agentId: me.agentId || line.agentId, kills: 27, deaths: 13, assists: 6, acs: 318, adr: 196, hs: 31, kast: 82, ddelta: 48,
+      firstBloods: 5, firstDeaths: 2, multikills: 3, aces: 1, clutches: 2, plants: 4, defuses: 1, econ: 88,
+      mvp: true, teamMvp: true, medal: "distinction", perf: 448, offense: 462, support: 301, offTrend: "double_up", supTrend: "up",
+      offFactors: [["killImpact", "double_up"], ["damage", "double_up"], ["trades", "up"], ["deathImpact", "neutral"]],
+      supFactors: [["assists", "neutral"], ["utilityUsage", "up"], ["plants", "up"], ["defuses", "neutral"]],
+    });
+    line.score = line.acs * total;
+    line.damage = line.adr * total;
+    this._spread(line, total, this._rng("demo-result-me"));
+    // Ton ace et ton clutch
+    const won = d.rounds.map((r, i) => (r.winner === "Blue" ? i : -1)).filter((i) => i >= 0);
+    const ace = won.reduce((best, i) => (line.roundKills[i] > line.roundKills[best] ? i : best), won[0]);
+    line.roundKills[ace] = 5;
+    Object.assign(d.rounds[ace], { ceremony: "Ace", player: me.puuid });
+    const clutch = d.rounds.findIndex((r, i) => i !== ace && r.winner === "Blue" && i > 3);
+    if (clutch >= 0) Object.assign(d.rounds[clutch], { ceremony: "Clutch", player: me.puuid });
+    for (const t of d.teams) t.players.sort((a, b) => b.acs - a.acs);
+    const endMs = Date.now() - 2 * 60000;
+    d.startMs = endMs - d.lengthMs;
+    this._result = { puuid: me.puuid, detail: d, rr: { earned: 21, tierBefore: 20, tierAfter: 21, rrBefore: 88, rrAfter: 9, afkPenalty: 0 }, at: endMs };
+    return this._result;
+  },
+
+  /** Répartit le score et les kills d'un joueur sur les manches. */
+  _spread(p, total, rnd) {
+    const w = Array.from({ length: total }, () => 0.08 + Math.pow(rnd(), 1.7));
+    const sum = w.reduce((a, b) => a + b, 0);
+    p.roundScores = w.map((x) => Math.round((x / sum) * p.score));
+    p.roundKills = Array(total).fill(0);
+    for (let k = 0; k < p.kills; k++) {
+      let r = 0;
+      let x = rnd() * sum;
+      while (r < total - 1 && (x -= w[r]) > 0) r++;
+      if (p.roundKills[r] < 4) p.roundKills[r]++;
+    }
+  },
+
+  _match(assets, id, perspective, { win } = {}) {
     const rnd = this._rng(id);
     const maps = this._maps(assets);
     const agents = [...(assets?.agents.keys() || [])];
     const cards = assets?.cards || [];
     const [mapId] = maps[Math.floor(rnd() * maps.length)] || [""];
-    const blueWon = rnd() > 0.45;
+    const blueWon = win ?? rnd() > 0.45;
     const loser = 5 + Math.floor(rnd() * 7);
     const [blueR, redR] = blueWon ? [13, loser] : [loser, 13];
     const results = ["Elimination", "Elimination", "Elimination", "Detonate", "Defuse", "Timer"];
@@ -141,7 +193,7 @@ window.DEMO = {
     const last = blueWon ? "Blue" : "Red";
     const li = winners.lastIndexOf(last);
     [winners[li], winners[winners.length - 1]] = [winners[winners.length - 1], winners[li]];
-    const rounds = winners.map((w) => ({ winner: w, result: results[Math.floor(rnd() * results.length)] }));
+    const rounds = winners.map((w) => ({ winner: w, result: results[Math.floor(rnd() * results.length)], ceremony: "", player: "" }));
     const names = ["Nova", "Nyx", "Kairo", "Vesper", "mirage", "Tenz0r", "lxrd", "Saphir", "Wildfire", "momo"];
     const total = blueR + redR;
     const players = names.map((name, i) => {
@@ -159,6 +211,24 @@ window.DEMO = {
         multikills: Math.floor(rnd() * 4), aces: rnd() > 0.93 ? 1 : 0, mvp: false, teamMvp: false,
       };
     });
+    // Médailles de fin de partie et score de chaque manche
+    const trend = (v) => (v >= 400 ? "double_up" : v >= 300 ? "up" : v >= 200 ? "neutral" : v >= 120 ? "down" : "double_down");
+    const near = (v) => trend(Math.max(0, Math.min(500, v + (rnd() - 0.5) * 160)));
+    for (const p of players) {
+      const clamp = (v) => Math.round(Math.max(20, Math.min(500, v)));
+      const offense = clamp((p.kills / total) * 330 + rnd() * 70);
+      const support = clamp(p.assists * 28 + 60 + rnd() * 160);
+      const perf = clamp(offense * 0.62 + support * 0.38 + (rnd() - 0.5) * 40);
+      Object.assign(p, {
+        score: p.acs * total, damage: p.adr * total, rounds: total, clutches: rnd() > 0.75 ? 1 : 0,
+        plants: Math.floor(rnd() * 4), defuses: Math.floor(rnd() * 2), econ: Math.round(50 + rnd() * 40),
+        perf, offense, support, medal: perf >= 420 ? "distinction" : perf >= 330 ? "merit" : "pass",
+        offTrend: trend(offense), supTrend: trend(support),
+        offFactors: ["damage", "deathImpact", "killImpact", "trades"].map((k) => [k, near(offense)]),
+        supFactors: ["assists", "defuses", "plants", "utilityUsage"].map((k) => [k, near(support)]),
+      });
+      this._spread(p, total, rnd);
+    }
     const team = (teamId, list, won, roundsWon) => {
       list.sort((a, b) => b.acs - a.acs);
       list[0].teamMvp = true;
@@ -167,7 +237,8 @@ window.DEMO = {
     const teams = [team("Blue", players.slice(0, 5), blueWon, blueR), team("Red", players.slice(5), !blueWon, redR)];
     const top = [...players].sort((a, b) => b.acs - a.acs)[0];
     top.mvp = true;
-    return { matchId: id, mapId, queueId: "competitive", actName: "V26 · ACTE V", startMs: Date.now() - 5 * 3_600_000, lengthMs: 38 * 60000, teams, rounds };
+    const perfScale = { avg: 250, max: 500, merit: 330, distinction: 420 };
+    return { matchId: id, mapId, queueId: "competitive", actName: "V26 · ACTE V", startMs: Date.now() - 5 * 3_600_000, lengthMs: 38 * 60000, teams, rounds, perfScale };
   },
 
   snapshot(assets, phase = "ingame") {

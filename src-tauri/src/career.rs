@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
 /// Riot limite l'historique à 20 entrées par requête.
@@ -90,6 +90,10 @@ pub struct CareerCache {
     /// Données publiques (sans le jeu) et joueurs connus
     henrik: Arc<Henrik>,
     people: Arc<Directory>,
+    /// Dernière partie terminée (écran de fin de partie) et match en cours de récupération
+    last_result: Mutex<Option<MatchResult>>,
+    /// Match guetté : (identifiant, fin de l'attente, résultat livré)
+    result_for: Mutex<Option<(String, Instant, bool)>>,
 }
 
 impl CareerCache {
@@ -108,6 +112,8 @@ impl CareerCache {
             pages: Mutex::new(HashMap::new()),
             henrik,
             people,
+            last_result: Mutex::new(None),
+            result_for: Mutex::new(None),
         }
     }
 
@@ -279,7 +285,7 @@ async fn archive_once(riot: &Riot, cache: &CareerCache, shared: &Shared) -> anyh
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct ParsedMatch {
     map_id: String,
     queue_id: String,
@@ -290,6 +296,30 @@ struct ParsedMatch {
     teams: HashMap<String, (bool, u32)>,
     players: HashMap<String, PlayerStats>,
     rounds: Vec<RoundInfo>,
+    /// MVP officiels (Riot) : du match, et de chaque équipe
+    #[serde(default)]
+    mvp: String,
+    #[serde(default)]
+    team_mvps: HashMap<String, String>,
+    /// Barème du score de performance (médailles)
+    #[serde(default)]
+    perf_scale: Option<PerfScale>,
+    /// Version de l'analyse Riot (`PARSE_REV`) ; 0 = HenrikDev ou analyse sans médailles
+    #[serde(default)]
+    rev: u32,
+}
+
+/// Analyse Riot avec médailles, score de performance et score par manche.
+const PARSE_REV: u32 = 2;
+
+/// Barème du score de performance de fin de partie (0 à `max`, moyenne `avg`).
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PerfScale {
+    pub avg: f32,
+    pub max: f32,
+    pub merit: f32,
+    pub distinction: f32,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -325,6 +355,23 @@ struct PlayerStats {
     flawless: u32,
     /// crédits dépensés (pour l'Econ rating)
     spent: u32,
+    /// Médaille de fin de partie (« distinction », « merit », « pass »), vide si inconnue
+    medal: String,
+    /// Score de performance (0 à 500) et ses deux volets, attaque et soutien
+    perf: f32,
+    offense: f32,
+    support: f32,
+    /// Tendances attaque / soutien (« double_up », « up », « neutral », « down », « double_down »)
+    off_trend: String,
+    sup_trend: String,
+    /// Facteurs détaillés : (facteur, tendance)
+    off_factors: Vec<(String, String)>,
+    sup_factors: Vec<(String, String)>,
+    /// Score de combat et kills de chaque manche
+    round_scores: Vec<u32>,
+    round_kills: Vec<u32>,
+    plants: u32,
+    defuses: u32,
     /// Ligne provisoire (résumé HenrikDev) : pas de stats avancées
     #[serde(skip)]
     light: bool,
@@ -345,6 +392,12 @@ pub struct RoundInfo {
     pub winner: String,
     /// "Elimination", "Defuse", "Detonate", "Timer", "Surrender"…
     pub result: String,
+    /// Cérémonie de la manche : "Ace", "Clutch", "Flawless", "Thrifty", "TeamAce", "Closer"…
+    #[serde(default)]
+    pub ceremony: String,
+    /// Joueur de la cérémonie (ace, clutch)
+    #[serde(default)]
+    pub player: String,
 }
 
 #[derive(Serialize)]
@@ -475,7 +528,7 @@ pub struct MapStat {
     pub round_win: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchDetail {
     pub match_id: String,
@@ -488,9 +541,11 @@ pub struct MatchDetail {
     pub rounds: Vec<RoundInfo>,
     /// Pseudos en cours de récupération (événement `match-names` à l'arrivée)
     pub names_pending: bool,
+    /// Barème des médailles (absent : match sans médailles)
+    pub perf_scale: Option<PerfScale>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamLine {
     pub team_id: String,
@@ -499,7 +554,7 @@ pub struct TeamLine {
     pub players: Vec<PlayerLine>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerLine {
     pub puuid: String,
@@ -525,6 +580,25 @@ pub struct PlayerLine {
     pub aces: u32,
     pub mvp: bool,
     pub team_mvp: bool,
+    /// Score de combat total, dégâts infligés et manches jouées
+    pub score: u32,
+    pub damage: u32,
+    pub rounds: u32,
+    pub clutches: u32,
+    pub plants: u32,
+    pub defuses: u32,
+    /// Econ rating (dégâts pour 1000 crédits dépensés)
+    pub econ: u32,
+    pub medal: Option<String>,
+    pub perf: Option<u32>,
+    pub offense: Option<u32>,
+    pub support: Option<u32>,
+    pub off_trend: Option<String>,
+    pub sup_trend: Option<String>,
+    pub off_factors: Vec<(String, String)>,
+    pub sup_factors: Vec<(String, String)>,
+    pub round_scores: Vec<u32>,
+    pub round_kills: Vec<u32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -612,6 +686,7 @@ pub async fn get_match(
         Ok(None) => return Err("match introuvable".into()),
         Err(e) => return Err(format!("{e:#}")),
     };
+    let parsed = with_medals(&riot, &cache, &match_id, parsed).await;
     let act = shared.act_name(&parsed.season_id);
     if !parsed.players.values().any(|p| p.name.is_empty()) || !cache.henrik.available() {
         return Ok(detail(&match_id, &parsed, act));
@@ -645,6 +720,158 @@ pub async fn get_match(
             Ok(d)
         }
     }
+}
+
+/// Match analysé avant l'arrivée des médailles (ou venu de HenrikDev) : relu une fois chez Riot,
+/// pseudos conservés. Sans réponse rapide de Riot, l'ancienne analyse est affichée.
+async fn with_medals(riot: &Riot, cache: &CareerCache, id: &str, old: Arc<ParsedMatch>) -> Arc<ParsedMatch> {
+    if old.rev >= PARSE_REV || !riot.connected() {
+        return old;
+    }
+    let path = format!("/match-details/v1/matches/{id}");
+    let Ok(Ok(Some(v))) = tokio::time::timeout(Duration::from_secs(4), riot.pd(&path)).await else { return old };
+    let mut fresh = parse_match(&v);
+    if fresh.players.is_empty() {
+        return old;
+    }
+    for (puuid, p) in fresh.players.iter_mut().filter(|(_, p)| p.name.is_empty()) {
+        if let Some(o) = old.players.get(puuid) {
+            p.name = o.name.clone();
+            p.tag = o.tag.clone();
+        }
+    }
+    cache.put(id, fresh)
+}
+
+/// Écran de fin de partie : le match qui vient de se terminer, vu par le joueur.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchResult {
+    pub puuid: String,
+    pub detail: MatchDetail,
+    /// Évolution du classement (parties classées)
+    pub rr: Option<RrChange>,
+    /// Arrivée du résultat (ms)
+    pub at: u64,
+}
+
+#[derive(Serialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RrChange {
+    pub earned: i32,
+    pub tier_before: u32,
+    pub tier_after: u32,
+    pub rr_before: u32,
+    pub rr_after: u32,
+    pub afk_penalty: i32,
+}
+
+#[tauri::command]
+pub fn get_last_result(cache: State<'_, Arc<CareerCache>>) -> Option<MatchResult> {
+    cache.last_result.lock().unwrap().clone()
+}
+
+/// Fin d'une partie : Riot publie le détail du match quelques secondes à quelques minutes plus
+/// tard. On le guette en arrière-plan (une requête toutes les 5 s), puis l'écran de fin de partie
+/// est envoyé à l'interface (événement `match-result`). `names` : pseudos vus pendant la partie
+/// (`None` = joueur en mode incognito, qui le reste).
+pub fn spawn_result(app: AppHandle, riot: Arc<Riot>, cache: Arc<CareerCache>, shared: Arc<Shared>, match_id: String, names: HashMap<String, Option<(String, String)>>) {
+    const WATCH: Duration = Duration::from_secs(300);
+    {
+        let mut current = cache.result_for.lock().unwrap();
+        if let Some((_, until, delivered)) = current.as_mut().filter(|(id, _, _)| *id == match_id) {
+            // Déjà livré, ou guet en cours (fausse fin de partie plus tôt : on prolonge l'attente)
+            if !*delivered {
+                *until = Instant::now() + WATCH;
+            }
+            return;
+        }
+        *current = Some((match_id.clone(), Instant::now() + WATCH, false));
+    }
+    tauri::async_runtime::spawn(async move {
+        let me = riot.puuid();
+        let path = format!("/match-details/v1/matches/{match_id}");
+        let started = Instant::now();
+        let mut parsed = None;
+        let watching = || cache.result_for.lock().unwrap().as_ref().is_some_and(|(id, until, _)| *id == match_id && Instant::now() < *until);
+        while watching() {
+            if let Ok(Some(v)) = riot.pd(&path).await {
+                let p = parse_match(&v);
+                if p.players.contains_key(&me) {
+                    parsed = Some(cache.put(&match_id, p));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        let short = &match_id[..8.min(match_id.len())];
+        let Some(parsed) = parsed else {
+            crate::tracker::diag(&app, &format!("fin de partie {short} : détail du match indisponible"));
+            // Nouvel essai possible si la même partie est de nouveau vue terminée
+            let mut current = cache.result_for.lock().unwrap();
+            if current.as_ref().is_some_and(|(id, _, _)| *id == match_id) {
+                *current = None;
+            }
+            return;
+        };
+        // Historique récent désormais périmé : la carrière doit montrer ce match
+        cache.pages.lock().unwrap().clear();
+        let mut named = (*parsed).clone();
+        for (puuid, p) in named.players.iter_mut() {
+            match names.get(puuid) {
+                Some(Some((name, tag))) => {
+                    p.name = name.clone();
+                    p.tag = tag.clone();
+                }
+                Some(None) if *puuid != me => {
+                    p.name.clear();
+                    p.tag.clear();
+                }
+                _ => {}
+            }
+        }
+        let rr = if parsed.queue_id == "competitive" { rr_change(&riot, &me, &match_id).await } else { None };
+        let detail = detail(&match_id, &named, shared.act_name(&parsed.season_id));
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let medal = named.players.get(&me).map(|p| p.medal.clone()).unwrap_or_default();
+        let result = MatchResult { puuid: me, detail, rr, at };
+        crate::tracker::diag(
+            &app,
+            &format!(
+                "fin de partie {short} : résultat prêt en {:.0} s (médaille {}, RR {})",
+                started.elapsed().as_secs_f32(),
+                if medal.is_empty() { "—" } else { medal.as_str() },
+                result.rr.as_ref().map_or("—".to_string(), |r| format!("{:+}", r.earned)),
+            ),
+        );
+        *cache.last_result.lock().unwrap() = Some(result.clone());
+        if let Some((_, _, delivered)) = cache.result_for.lock().unwrap().as_mut() {
+            *delivered = true;
+        }
+        let _ = app.emit("match-result", &result);
+    });
+}
+
+/// Points de classement gagnés ou perdus sur ce match (publiés par Riot peu après le match).
+async fn rr_change(riot: &Riot, puuid: &str, match_id: &str) -> Option<RrChange> {
+    let path = format!("/mmr/v1/players/{puuid}/competitiveupdates?startIndex=0&endIndex=5&queue=competitive");
+    for _ in 0..12 {
+        if let Ok(Some(v)) = riot.pd(&path).await {
+            if let Some(m) = v["Matches"].as_array().into_iter().flatten().find(|m| m["MatchID"].as_str() == Some(match_id)) {
+                let n = |k: &str| m[k].as_i64().unwrap_or(0);
+                return Some(RrChange {
+                    earned: n("RankedRatingEarned") as i32,
+                    tier_before: n("TierBeforeUpdate") as u32,
+                    tier_after: n("TierAfterUpdate") as u32,
+                    rr_before: n("RankedRatingBeforeUpdate") as u32,
+                    rr_after: n("RankedRatingAfterUpdate") as u32,
+                    afk_penalty: n("AFKPenalty") as i32,
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    None
 }
 
 /// Pseudos d'un match lu chez Riot, complétés par HenrikDev et gardés en cache.
@@ -1504,8 +1731,29 @@ fn detail(id: &str, m: &ParsedMatch, act_name: Option<String>) -> MatchDetail {
                         first_deaths: p.first_deaths,
                         multikills: p.multikills,
                         aces: p.aces,
-                        mvp: top > 0 && p.acs() == top,
-                        team_mvp: team_top > 0 && p.acs() == team_top,
+                        // MVP officiels de Riot quand ils existent, sinon le meilleur ACS
+                        mvp: if m.mvp.is_empty() { top > 0 && p.acs() == top } else { m.mvp == *puuid },
+                        team_mvp: match m.team_mvps.get(team_id) {
+                            Some(id) => id == puuid,
+                            None => team_top > 0 && p.acs() == team_top,
+                        },
+                        score: p.score,
+                        damage: p.damage,
+                        rounds: p.rounds,
+                        clutches: p.clutches,
+                        plants: p.plants,
+                        defuses: p.defuses,
+                        econ: if p.spent > 0 { (p.damage as f64 * 1000.0 / p.spent as f64).round() as u32 } else { 0 },
+                        medal: Some(p.medal.clone()).filter(|s| !s.is_empty()),
+                        perf: Some(p.perf.round() as u32).filter(|_| !p.medal.is_empty()),
+                        offense: Some(p.offense.round() as u32).filter(|_| !p.off_trend.is_empty()),
+                        support: Some(p.support.round() as u32).filter(|_| !p.sup_trend.is_empty()),
+                        off_trend: Some(p.off_trend.clone()).filter(|s| !s.is_empty()),
+                        sup_trend: Some(p.sup_trend.clone()).filter(|s| !s.is_empty()),
+                        off_factors: p.off_factors.clone(),
+                        sup_factors: p.sup_factors.clone(),
+                        round_scores: p.round_scores.clone(),
+                        round_kills: p.round_kills.clone(),
                     }
                 })
                 .collect();
@@ -1525,6 +1773,7 @@ fn detail(id: &str, m: &ParsedMatch, act_name: Option<String>) -> MatchDetail {
         teams,
         rounds: m.rounds.clone(),
         names_pending: false,
+        perf_scale: m.perf_scale.filter(|_| m.players.values().any(|p| !p.medal.is_empty())),
     }
 }
 
@@ -1708,15 +1957,28 @@ fn parse_match(v: &Value) -> ParsedMatch {
     let text = |x: &Value| x.as_str().unwrap_or("").to_string();
     let info = &v["matchInfo"];
     let mut players: HashMap<String, PlayerStats> = HashMap::new();
+    let mut perf_scale = None;
     for p in v["players"].as_array().into_iter().flatten() {
         let Some(id) = p["subject"].as_str() else { continue };
         if p["isObserver"].as_bool().unwrap_or(false) {
             continue;
         }
         let st = &p["stats"];
+        let mut medal = PlayerStats::default();
+        if let Some(scale) = read_medal(&p["scores"], &mut medal) {
+            perf_scale = Some(scale);
+        }
         players.insert(
             id.to_string(),
             PlayerStats {
+                medal: medal.medal,
+                perf: medal.perf,
+                offense: medal.offense,
+                support: medal.support,
+                off_trend: medal.off_trend,
+                sup_trend: medal.sup_trend,
+                off_factors: medal.off_factors,
+                sup_factors: medal.sup_factors,
                 team: text(&p["teamId"]),
                 agent: text(&p["characterId"]).to_lowercase(),
                 name: text(&p["gameName"]),
@@ -1738,8 +2000,24 @@ fn parse_match(v: &Value) -> ParsedMatch {
     let mut rounds_won: HashMap<String, u32> = HashMap::new();
     let mut flawless: HashMap<String, u32> = HashMap::new();
     let mut rounds: Vec<RoundInfo> = Vec::new();
+    let round_list = v["roundResults"].as_array().cloned().unwrap_or_default();
+    for p in players.values_mut() {
+        p.round_scores = vec![0; round_list.len()];
+        p.round_kills = vec![0; round_list.len()];
+    }
 
-    for round in v["roundResults"].as_array().into_iter().flatten() {
+    for (index, round) in round_list.iter().enumerate() {
+        for s in round["playerScores"].as_array().into_iter().flatten() {
+            if let Some(p) = s["subject"].as_str().and_then(|id| players.get_mut(id)) {
+                p.round_scores[index] = num(&s["score"]);
+            }
+        }
+        if let Some(p) = round["bombPlanter"].as_str().and_then(|id| players.get_mut(id)) {
+            p.plants += 1;
+        }
+        if let Some(p) = round["bombDefuser"].as_str().and_then(|id| players.get_mut(id)) {
+            p.defuses += 1;
+        }
         let mut kills: Vec<Kill> = Vec::new();
         for ps in round["playerStats"].as_array().into_iter().flatten() {
             let subject = ps["subject"].as_str().unwrap_or("");
@@ -1781,9 +2059,16 @@ fn parse_match(v: &Value) -> ParsedMatch {
         let ceremony = round["roundCeremony"].as_str().unwrap_or("");
         let ceremony_player = round["ceremonyPlayer"].as_str().unwrap_or("");
         let winner = text(&round["winningTeam"]);
+        for k in kills.iter().filter(|k| team_of.contains_key(&k.victim) && team_of.get(&k.killer) != team_of.get(&k.victim)) {
+            if let Some(p) = players.get_mut(&k.killer) {
+                p.round_kills[index] += 1;
+            }
+        }
         let t = RoundTally { team_of: &team_of, rounds_won: &mut rounds_won, flawless: &mut flawless };
         score_round(&mut players, t, kills, first_blood, ceremony, ceremony_player, &winner);
-        rounds.push(RoundInfo { winner, result: round_result(round) });
+        let ceremony = ceremony.trim_start_matches("Ceremony");
+        let ceremony = if ceremony == "Default" { "" } else { ceremony };
+        rounds.push(RoundInfo { winner, result: round_result(round), ceremony: ceremony.to_string(), player: ceremony_player.to_string() });
     }
     for p in players.values_mut() {
         p.rounds_won = rounds_won.get(&p.team).copied().unwrap_or(0);
@@ -1798,6 +2083,12 @@ fn parse_match(v: &Value) -> ParsedMatch {
             Some((t["teamId"].as_str()?.to_string(), (t["won"].as_bool().unwrap_or(false), num(&t["roundsWon"]))))
         })
         .collect();
+    let team_mvps = v["teams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| Some((t["teamId"].as_str()?.to_string(), t["mvp"].as_str().filter(|s| !s.is_empty())?.to_string())))
+        .collect();
     ParsedMatch {
         map_id: text(&info["mapId"]),
         queue_id: info["queueID"].as_str().or(info["queueId"].as_str()).unwrap_or("").to_string(),
@@ -1807,7 +2098,61 @@ fn parse_match(v: &Value) -> ParsedMatch {
         teams,
         players,
         rounds,
+        mvp: text(&v["matchMvp"]),
+        team_mvps,
+        perf_scale,
+        rev: PARSE_REV,
     }
+}
+
+const MEDALS: [&str; 3] = ["distinction", "merit", "pass"];
+const TRENDS: [&str; 5] = ["double_up", "up", "neutral", "down", "double_down"];
+
+/// Médailles de fin de partie (2026). Riot range ces données sous des clés provisoires
+/// (« TempValue… ») : clés connues d'abord, sinon chaque donnée est reconnue à sa forme.
+///   F = score de performance, G / H = volets attaque / soutien (0 à 500, moyenne 250)
+///   L = { O: médaille, M / N: tendances attaque / soutien, P / Q: facteurs détaillés }
+///   T = { R: moyenne, U: maximum, S: { distinction, merit, pass } seuils des médailles }
+fn read_medal(scores: &Value, s: &mut PlayerStats) -> Option<PerfScale> {
+    let obj = scores.as_object()?;
+    let is_medal = |x: &Value| x.as_str().is_some_and(|m| MEDALS.contains(&m));
+    let is_trend = |x: &Value| x.as_str().is_some_and(|t| TRENDS.contains(&t));
+    // Bloc de la médaille : l'objet qui contient « distinction », « merit » ou « pass »
+    let l = obj
+        .get("TempValueL")
+        .filter(|l| l.as_object().is_some_and(|o| o.values().any(is_medal)))
+        .or_else(|| obj.values().find(|v| v.as_object().is_some_and(|o| o.values().any(is_medal))))?
+        .as_object()?;
+    s.medal = l.get("TempValueO").filter(|m| is_medal(m)).or_else(|| l.values().find(|v| is_medal(v)))?.as_str()?.to_string();
+    // Tendances : attaque puis soutien (ordre des clés M, N)
+    let trends: Vec<String> = l.values().filter(|v| is_trend(v)).filter_map(|v| v.as_str().map(String::from)).collect();
+    let trend = |key: &str, i: usize| l.get(key).filter(|t| is_trend(t)).and_then(|t| t.as_str().map(String::from)).or_else(|| trends.get(i).cloned());
+    s.off_trend = trend("TempValueM", 0).unwrap_or_default();
+    s.sup_trend = trend("TempValueN", 1).unwrap_or_default();
+    let factors = |marker: &str| -> Vec<(String, String)> {
+        l.values()
+            .filter_map(Value::as_object)
+            .find(|o| o.contains_key(marker))
+            .map(|o| o.iter().filter(|(_, t)| is_trend(t)).map(|(k, t)| (k.clone(), t.as_str().unwrap_or("").to_string())).collect())
+            .unwrap_or_default()
+    };
+    s.off_factors = factors("killImpact");
+    s.sup_factors = factors("utilityUsage");
+    let number = |key: &str| obj.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    s.perf = number("TempValueF");
+    s.offense = number("TempValueG");
+    s.support = number("TempValueH");
+    // Barème : l'objet qui contient les seuils { distinction, merit }
+    let has_thresholds = |o: &serde_json::Map<String, Value>| o.values().any(|v| v.get("distinction").is_some_and(Value::is_number));
+    let t = obj.get("TempValueT").and_then(Value::as_object).filter(|o| has_thresholds(o)).or_else(|| obj.values().filter_map(Value::as_object).find(|o| has_thresholds(o)));
+    let get = |o: Option<&serde_json::Map<String, Value>>, key: &str, or: f32| o.and_then(|o| o.get(key)).and_then(Value::as_f64).map_or(or, |v| v as f32);
+    let th = t.and_then(|t| t.values().filter_map(Value::as_object).find(|o| o.contains_key("distinction")));
+    Some(PerfScale {
+        avg: get(t, "TempValueR", 250.0),
+        max: get(t, "TempValueU", 500.0),
+        merit: get(th, "merit", 330.0),
+        distinction: get(th, "distinction", 420.0),
+    })
 }
 
 /// Compteurs de manches par équipe, remplis par `score_round`.
@@ -1994,7 +2339,9 @@ fn parse_henrik_match(d: &Value) -> Option<ParsedMatch> {
         let t = RoundTally { team_of: &team_of, rounds_won: &mut rounds_won, flawless: &mut flawless };
         score_round(&mut players, t, kills, None, ceremony, &ceremony_player, &winner);
         let result = text(&round["result"]);
-        rounds.push(RoundInfo { winner, result: round_result(&serde_json::json!({ "roundResultCode": result, "roundResult": result })) });
+        let ceremony = ceremony.trim_start_matches("Ceremony");
+        let ceremony = if ceremony == "Default" { "" } else { ceremony }.to_string();
+        rounds.push(RoundInfo { winner, result: round_result(&serde_json::json!({ "roundResultCode": result, "roundResult": result })), ceremony, player: ceremony_player });
     }
     for p in players.values_mut() {
         p.rounds_won = rounds_won.get(&p.team).copied().unwrap_or(0);
@@ -2020,6 +2367,7 @@ fn parse_henrik_match(d: &Value) -> Option<ParsedMatch> {
         teams,
         players,
         rounds,
+        ..Default::default()
     })
 }
 
@@ -2412,5 +2760,86 @@ mod tests {
         }
         assert_eq!(d.teams.iter().map(|t| t.players.len()).sum::<usize>(), 10);
         assert_eq!(d.rounds.len() as u32, d.teams.iter().map(|t| t.rounds_won).sum::<u32>());
+    }
+
+    #[test]
+    fn medal_fields() {
+        let scores = serde_json::json!({
+            "TempValueF": 413.9, "TempValueG": 278.9, "TempValueH": 500,
+            "TempValueL": { "TempValueO": "merit", "TempValueM": "neutral", "TempValueN": "double_up",
+                "TempValueP": { "damage": "neutral", "deathImpact": "up", "killImpact": "neutral", "trades": "down" },
+                "TempValueQ": { "assists": "double_up", "defuses": "neutral", "plants": "neutral", "utilityUsage": "up" } },
+            "TempValueT": { "TempValueR": 250, "TempValueV": 0, "TempValueU": 500, "TempValueS": { "distinction": 420, "merit": 330, "pass": 0 } }
+        });
+        let mut s = PlayerStats::default();
+        let scale = read_medal(&scores, &mut s).unwrap();
+        assert_eq!(scale, PerfScale { avg: 250.0, max: 500.0, merit: 330.0, distinction: 420.0 });
+        assert_eq!((s.medal.as_str(), s.perf.round(), s.offense.round(), s.support.round()), ("merit", 414.0, 279.0, 500.0));
+        assert_eq!((s.off_trend.as_str(), s.sup_trend.as_str()), ("neutral", "double_up"));
+        assert_eq!(s.off_factors.len(), 4);
+        assert!(s.sup_factors.contains(&("assists".to_string(), "double_up".to_string())));
+        // Clés renommées par Riot : médaille et facteurs retrouvés à leur forme
+        let renamed = serde_json::json!({ "x": { "medal": "distinction", "a": { "killImpact": "up" }, "b": { "utilityUsage": "down" } } });
+        let mut s = PlayerStats::default();
+        let scale = read_medal(&renamed, &mut s).unwrap();
+        assert_eq!((s.medal.as_str(), scale.distinction), ("distinction", 420.0));
+        assert_eq!((s.off_factors.len(), s.sup_factors.len()), (1, 1));
+        // Match sans médailles
+        assert!(read_medal(&serde_json::json!({}), &mut PlayerStats::default()).is_none());
+    }
+
+    /// Médailles, score par manche et MVP d'un vrai match Riot (détail brut) ; écrit l'écran de fin
+    /// de partie correspondant pour l'aperçu de l'interface :
+    /// `VALO_RIOT_RAW=raw-match.json VALO_RESULT_OUT=result.json cargo test real_medals -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_medals() {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("VALO_RIOT_RAW").unwrap()).unwrap()).unwrap();
+        let m = parse_match(&v);
+        let scale = m.perf_scale.expect("barème");
+        assert!(!m.mvp.is_empty() && m.team_mvps.len() == 2);
+        for (id, p) in &m.players {
+            let expected = if p.perf >= scale.distinction { "distinction" } else if p.perf >= scale.merit { "merit" } else { "pass" };
+            println!("{} {:<11} perf {:>3.0} att {:>3.0} {:<11} sou {:>3.0} {:<11} acs {:>3} manches {:?}", &id[..8], p.medal, p.perf, p.offense, p.off_trend, p.support, p.sup_trend, p.acs(), p.round_scores);
+            assert_eq!(p.medal, expected);
+            assert_eq!(p.round_scores.iter().sum::<u32>(), p.score, "score par manche");
+            assert_eq!(p.round_scores.len(), m.rounds.len());
+            assert!(p.round_kills.iter().sum::<u32>() <= p.kills);
+        }
+        let d = detail("sample", &m, Some("V26 · ACTE V".into()));
+        let mvps: Vec<_> = d.teams.iter().flat_map(|t| &t.players).filter(|p| p.mvp).map(|p| p.puuid.clone()).collect();
+        assert_eq!(mvps, vec![m.mvp.clone()]);
+        if let Ok(out) = std::env::var("VALO_RESULT_OUT") {
+            let me = std::env::var("VALO_PUUID").unwrap_or_else(|_| m.mvp.clone());
+            let r = MatchResult { puuid: me, detail: d, rr: Some(RrChange { earned: 21, tier_before: 17, tier_after: 18, rr_before: 88, rr_after: 9, afk_penalty: 0 }), at: 0 };
+            std::fs::write(out, serde_json::to_string_pretty(&r).unwrap()).unwrap();
+        }
+    }
+
+    /// Écran de fin de partie du dernier match du joueur connecté (session Riot locale, lecture seule) :
+    /// `cargo test real_result -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_result() {
+        let riot = Riot::new();
+        tauri::async_runtime::block_on(async {
+            riot.ensure().await.unwrap();
+            let me = riot.puuid();
+            let hist = riot.pd(&format!("/match-history/v1/history/{me}?startIndex=0&endIndex=1")).await.unwrap().unwrap();
+            let id = hist["History"][0]["MatchID"].as_str().unwrap().to_string();
+            let v = riot.pd(&format!("/match-details/v1/matches/{id}")).await.unwrap().unwrap();
+            let m = parse_match(&v);
+            let d = detail(&id, &m, None);
+            let line = d.teams.iter().flat_map(|t| &t.players).find(|p| p.puuid == me).unwrap();
+            println!(
+                "{} {} : médaille {:?} perf {:?} attaque {:?} {:?} soutien {:?} {:?} · ACS {} KAST {} % · MVP {} / équipe {} · manches {:?}",
+                m.queue_id, &id[..8], line.medal, line.perf, line.offense, line.off_trend, line.support, line.sup_trend, line.acs, line.kast, line.mvp, line.team_mvp, line.round_scores
+            );
+            if m.queue_id == "competitive" {
+                let rr = rr_change(&riot, &me, &id).await.expect("évolution du classement");
+                println!("RR {rr:?}");
+                assert!(rr.tier_after > 0);
+            }
+        });
     }
 }

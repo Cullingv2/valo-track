@@ -439,6 +439,8 @@ impl Tracker {
                 return Duration::from_secs(5);
             }
             Ok(Conn::NoValorant) => {
+                // Jeu fermé juste après une partie : son résultat reste disponible
+                self.game_over();
                 self.status(Phase::Waiting, None);
                 return Duration::from_secs(4);
             }
@@ -596,7 +598,7 @@ impl Tracker {
         let Some(p) = self.riot.glz(&format!("/pregame/v1/players/{me}")).await? else { return Ok(false) };
         let Some(match_id) = p["MatchID"].as_str().map(String::from) else { return Ok(false) };
         let Some(m) = self.riot.glz(&format!("/pregame/v1/matches/{match_id}")).await? else { return Ok(false) };
-        self.core_match = None;
+        self.game_over();
         self.refresh_own_party(&match_id).await;
 
         let team = &m["AllyTeam"];
@@ -629,8 +631,25 @@ impl Tracker {
         Ok(true)
     }
 
+    /// On quitte une partie : l'écran de fin de partie se prépare en arrière-plan.
+    fn game_over(&mut self) {
+        let Some((match_id, m)) = self.core_match.take() else { return };
+        if m["ProvisioningFlow"].as_str() == Some("ShootingRange") {
+            return;
+        }
+        // Pseudos affichés pendant la partie (None = incognito, masqué aussi dans le résultat)
+        let names = self
+            .last
+            .players
+            .iter()
+            .map(|p| (p.puuid.clone(), p.name.clone().map(|n| (n, p.tag.clone().unwrap_or_default()))))
+            .collect();
+        let cache = self.app.state::<Arc<crate::career::CareerCache>>().inner().clone();
+        crate::career::spawn_result(self.app.clone(), self.riot.clone(), cache, self.shared.clone(), match_id, names);
+    }
+
     async fn menus(&mut self, own: Option<&Value>) -> anyhow::Result<()> {
-        self.core_match = None;
+        self.game_over();
         self.party_for = None;
         let me = self.riot.puuid();
         let mut queue = None;

@@ -52,6 +52,7 @@ fn main() {
             career::get_career,
             career::get_match,
             career::prefetch_players,
+            career::get_last_result,
             tracker::get_rank,
             overlay::show_overlay,
             overlay::hide_overlay,

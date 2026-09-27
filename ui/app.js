@@ -341,7 +341,8 @@ function viewMenus(s) {
       <div class="team-title"><small>${esc(queueLabel(s) || "Salon")}</small><span>${solo ? "Ton profil" : "Ton groupe"}</span></div>
       ${solo ? `<div class="hint-txt">Les rangs de ta partie s'afficheront dès la sélection des agents.</div>` : ""}
     </div>
-    <div class="cards">${s.players.map((p, i) => playerCard(p, i)).join("")}</div>`;
+    <div class="cards">${s.players.map((p, i) => playerCard(p, i)).join("")}</div>
+    ${lastResultCard()}`;
 }
 
 /* ───────────── Carrière & détail de match ─────────────
@@ -994,6 +995,14 @@ function matchBody(v) {
         .join("")}</div>`
     : "";
 
+  return `${head}${rounds}${matchTeams(v, d)}`;
+}
+
+/** Tableau des scores des deux équipes, vu depuis `v.perspective`. */
+function matchTeams(v, d) {
+  const mine = d.teams.find((t) => t.players.some((p) => p.puuid === v.perspective)) || d.teams[0];
+  const others = d.teams.filter((t) => t !== mine);
+  const draw = others[0] && others[0].roundsWon === mine?.roundsWon;
   const team = (t, ally, offset) => {
     if (!t) return "";
     const isMe = currentSnap()?.players.some((p) => p.isMe && p.puuid === v.perspective);
@@ -1009,8 +1018,7 @@ function matchBody(v) {
         ${rows}
       </div>`;
   };
-
-  return `${head}${rounds}${team(mine, true, 2)}${others.map((t) => team(t, false, 8)).join("")}`;
+  return `${team(mine, true, 2)}${others.map((t) => team(t, false, 8)).join("")}`;
 }
 
 /** Pseudo d'un joueur d'un ancien match. Riot ne fournit plus les pseudos dans le détail
@@ -1034,7 +1042,7 @@ function matchRow(p, v, i) {
       ? `<span class="n"><i class="sk sk-name"></i></span>`
       : `<span class="n hidden">${esc(a?.name || "Joueur")}</span><span class="tag">${hiddenLive(p.puuid) ? "masqué" : "anonyme"}</span>`;
   const dot = p.party != null ? `<i class="pdot" style="--pc:${PARTY_COLORS[p.party % PARTY_COLORS.length]}" title="En groupe"></i>` : "";
-  const badge = p.mvp ? `<span class="badge mvp">MVP</span>` : p.teamMvp ? `<span class="badge tmvp">Top</span>` : "";
+  const badge = medalChip(p) + (p.mvp ? `<span class="badge mvp">MVP</span>` : p.teamMvp ? `<span class="badge tmvp">Top</span>` : "");
   const kd = p.deaths ? p.kills / p.deaths : p.kills;
   const diff = p.kills - p.deaths;
   const focus = p.puuid === v.perspective ? " focus" : "";
@@ -1054,6 +1062,290 @@ function matchRow(p, v, i) {
       <b class="${p.firstDeaths ? "bad" : "dim"}">${p.firstDeaths}</b>
       <b class="${p.multikills ? "" : "dim"}">${p.multikills}${p.aces ? `<small class="ace">ACE</small>` : ""}</b>
     </div>`;
+}
+
+/* ── Fin de partie ──
+   Écran affiché après chaque partie : verdict, RR, médaille et score de performance (Riot),
+   stats du match, score de combat de chaque manche et tableau des scores. */
+
+const MEDALS = {
+  distinction: { label: "Distinction", stars: 3 },
+  merit: { label: "Mérite", stars: 2 },
+  pass: { label: "Réussite", stars: 1 },
+};
+const TRENDS = {
+  double_up: ["Excellent", "up2"],
+  up: ["Bon", "up"],
+  neutral: ["Moyen", "mid"],
+  down: ["Faible", "down"],
+  double_down: ["Très faible", "down2"],
+};
+const FACTORS = {
+  killImpact: "Impact des kills",
+  damage: "Dégâts infligés",
+  trades: "Échanges",
+  deathImpact: "Impact des morts",
+  assists: "Assistances",
+  utilityUsage: "Utilitaires",
+  plants: "Poses du spike",
+  defuses: "Désamorçages",
+};
+const FACTOR_ORDER = Object.keys(FACTORS);
+const CEREMONIES = { Ace: "ACE", Clutch: "CLUTCH", TeamAce: "TEAM ACE", Thrifty: "ÉCO", Flawless: "FLAWLESS", Closer: "CLOSER" };
+
+function medalChip(p) {
+  if (!p.medal) return "";
+  const m = MEDALS[p.medal] || MEDALS.pass;
+  return `<span class="mchip m-${esc(p.medal)}" title="${m.label} · score de performance ${p.perf ?? "—"}"><i></i>${p.perf ?? ""}</span>`;
+}
+
+function trendIcon(t) {
+  const paths = {
+    double_up: `<path d="M6 12l6-6 6 6"/><path d="M6 18l6-6 6 6"/>`,
+    up: `<path d="M6 15l6-6 6 6"/>`,
+    down: `<path d="M6 9l6 6 6-6"/>`,
+    double_down: `<path d="M6 6l6 6 6-6"/><path d="M6 12l6 6 6-6"/>`,
+  };
+  const cls = (TRENDS[t] || TRENDS.neutral)[1];
+  return `<svg class="ti t-${cls}" viewBox="0 0 24 24" aria-hidden="true">${paths[t] || `<path d="M7 12h10"/>`}</svg>`;
+}
+
+/** Emblème de la médaille : hexagone, chevron et étoiles (3 / 2 / 1), rayons pour la distinction. */
+function medalEmblem(kind) {
+  const n = MEDALS[kind]?.stars || 1;
+  const stars = Array.from({ length: n }, (_, i) => {
+    const x = 60 + (i - (n - 1) / 2) * 15;
+    return `<path class="st" style="--i:${i}" d="M${x} 22l4.5 6-4.5 6-4.5-6z"/>`;
+  }).join("");
+  const rays = kind === "distinction"
+    ? `<g class="rays">${Array.from({ length: 16 }, (_, i) => `<path d="M60 60L57.5 -14h5z" transform="rotate(${i * 22.5} 60 60)"/>`).join("")}</g>`
+    : "";
+  return `<svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
+    <defs><linearGradient id="medalGrad" x1="0" y1="0" x2="0.35" y2="1"><stop offset="0" style="stop-color:var(--m1)"/><stop offset="1" style="stop-color:var(--m2)"/></linearGradient></defs>
+    ${rays}
+    <path class="e-out" d="M60 4l50 28v56l-50 28-50-28V32z"/>
+    <path class="e-in" d="M60 13l42 24v46l-42 24-42-24V37z"/>
+    <path class="e-chev" d="M32 45h15l13 21 13-21h15L60 90z"/>
+    ${stars}
+  </svg>`;
+}
+
+function perfGauge(p, s) {
+  const x = (v) => Math.max(0, Math.min(1, v / (s.max || 500))).toFixed(4);
+  return `
+    <div class="gauge">
+      <div class="g-head"><span class="lbl">Barème</span>
+        <div class="g-legend"><i class="m-pass">Réussite</i><i class="m-merit">Mérite ${s.merit}+</i><i class="m-distinction">Distinction ${s.distinction}+</i></div>
+      </div>
+      <div class="g-track" style="--f:${x(p.perf)}">
+        <i class="g-zone m-merit" style="--a:${x(s.merit)};--b:${x(s.distinction)}"></i>
+        <i class="g-zone m-distinction" style="--a:${x(s.distinction)};--b:1"></i>
+        <i class="g-fill"></i>
+        <i class="g-avg" style="--x:${x(s.avg)}"></i>
+        <i class="g-you" style="--x:${x(p.perf)}"></i>
+      </div>
+      <div class="g-marks"><span style="--x:0">0</span><span style="--x:${x(s.avg)}">Moy. ${s.avg}</span><span style="--x:${x(s.merit)}">${s.merit}</span><span style="--x:${x(s.distinction)}">${s.distinction}</span><span style="--x:1">${s.max}</span></div>
+    </div>`;
+}
+
+function perfAxis(label, tip, score, trend, factors, s, i) {
+  const [word, cls] = TRENDS[trend] || TRENDS.neutral;
+  const list = (factors || []).slice().sort((a, b) => FACTOR_ORDER.indexOf(a[0]) - FACTOR_ORDER.indexOf(b[0]));
+  return `
+    <div class="pax t-${cls}" style="--i:${i}" title="${esc(tip)}">
+      <div class="ax-head"><span class="lbl">${label}</span><span class="trend t-${cls}">${trendIcon(trend)}${word}</span></div>
+      ${num(score ?? 0)}
+      <div class="ax-bar" style="--f:${Math.min(1, (score || 0) / (s.max || 500)).toFixed(4)};--avg:${(s.avg / (s.max || 500)).toFixed(4)}"><i></i></div>
+      <ul>${list.map(([k, t], j) => `<li style="--j:${j}"><span>${esc(FACTORS[k] || k)}</span>${trendIcon(t)}</li>`).join("")}</ul>
+    </div>`;
+}
+
+function rrBlock(rr) {
+  if (!rr) return `<div class="rs-rr none"></div>`;
+  const before = tier(rr.tierBefore);
+  const after = tier(rr.tierAfter);
+  const moved = rr.tierAfter !== rr.tierBefore && rr.tierBefore > 0;
+  const up = rr.tierAfter > rr.tierBefore;
+  const pct = (v) => (Math.max(0, Math.min(100, v)) / 100).toFixed(3);
+  let seg = "";
+  if (!moved && rr.earned > 0) seg = `<i class="rr-seg gain" style="--a:${pct(rr.rrBefore)};--b:${pct(rr.rrAfter)}"></i>`;
+  if (!moved && rr.earned < 0) seg = `<i class="rr-seg loss" style="--a:${pct(rr.rrAfter)};--b:${pct(rr.rrBefore)}"></i>`;
+  const arrow = `<svg class="rr-arrow" viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>`;
+  return `
+    <div class="rs-rr ${rr.earned >= 0 ? "pos" : "neg"}" style="--rc:${after.color}">
+      <div class="rr-icons">${moved ? `<img class="rr-old" src="${esc(before.icon)}" alt="" title="${esc(before.name)}">${arrow}` : ""}<img class="rr-new" src="${esc(after.icon)}" alt="" title="${esc(after.name)}"></div>
+      <div class="rr-txt">
+        ${moved ? `<span class="rr-move ${up ? "up" : "down"}">${up ? "Promotion" : "Rétrogradation"}</span>` : `<span class="lbl">Classement</span>`}
+        <div class="rr-earned">${num(rr.earned, { sign: true })}<small>RR</small></div>
+        <div class="rr-bar" style="--f:${pct(rr.rrAfter)}"><i class="fill"></i>${seg}</div>
+        <em>${esc(after.name)} · ${rr.rrAfter} RR${rr.afkPenalty ? ` · pénalité AFK ${rr.afkPenalty}` : ""}</em>
+      </div>
+    </div>`;
+}
+
+function resultHero(r, d, me, mine, them) {
+  const map = mapById(d.mapId);
+  const ffa = d.teams.length > 2;
+  const all = d.teams.flatMap((t) => t.players);
+  const place = 1 + all.filter((p) => p.kills > me.kills).length;
+  const draw = !ffa && them && them.roundsWon === mine.roundsWon;
+  const won = ffa ? place === 1 : !draw && mine.won;
+  const verdict = ffa && !won ? `${place}e place` : draw ? "Égalité" : won ? "Victoire" : "Défaite";
+  const queue = QUEUES[d.queueId] || (d.queueId ? d.queueId : "Partie personnalisée");
+  const mvp = me.mvp ? `<span class="rs-mvp">MVP du match</span>` : me.teamMvp ? `<span class="rs-mvp team">MVP de l'équipe</span>` : "";
+  const score = ffa
+    ? `<div class="rs-score"><b class="us">${me.kills}</b><span>kills</span></div>`
+    : `<div class="rs-score"><b class="us">${mine.roundsWon}</b><span>:</span><b class="them">${them?.roundsWon ?? 0}</b></div>`;
+  const ended = d.startMs ? timeAgo(d.startMs + (d.lengthMs || 0)) : "";
+  return `
+    <section class="rs-hero ${draw ? "draw" : won ? "win" : "loss"}">
+      <div class="rs-bg" style="background-image:url('${esc(map?.splash || "")}')"></div>
+      <i class="rs-slash"></i>
+      <div class="rs-hl">
+        <small>${esc(queue)}${d.actName ? ` · ${esc(d.actName)}` : ""}</small>
+        <h1 class="rs-verdict">${esc(verdict)}</h1>
+        <em>${esc(map?.name || "Carte")}${d.rounds.length > 1 ? ` · ${d.rounds.length} manches` : ""}${d.lengthMs ? ` · ${duration(d.lengthMs)}` : ""}${ended ? ` · ${esc(ended)}` : ""}</em>
+        ${mvp}
+      </div>
+      ${score}
+      ${rrBlock(r.rr)}
+    </section>`;
+}
+
+function resultMedal(me, s) {
+  if (!me.medal || !s) return "";
+  const m = MEDALS[me.medal] || MEDALS.pass;
+  return `
+    <section class="rs-medal m-${esc(me.medal)}">
+      <div class="rs-emblem">${medalEmblem(me.medal)}</div>
+      <div class="rs-mtxt">
+        <span class="lbl">Médaille de fin de partie</span>
+        <h2>${m.label}</h2>
+        <div class="rs-perf">${num(me.perf ?? 0)}<small>/ ${s.max}</small></div>
+        <span class="lbl">Score de performance</span>
+      </div>
+      ${perfGauge(me, s)}
+      <div class="axes">
+        ${perfAxis("Attaque", "Impact offensif : kills, dégâts, échanges, morts", me.offense, me.offTrend, me.offFactors, s, 0)}
+        ${perfAxis("Soutien", "Jeu d'équipe : assistances, utilitaires, spike", me.support, me.supTrend, me.supFactors, s, 1)}
+      </div>
+    </section>`;
+}
+
+function resultStats(me, d) {
+  const all = d.teams.flatMap((t) => t.players);
+  const place = 1 + all.filter((p) => p.acs > me.acs).length;
+  const rounds = Math.max(1, me.rounds || d.rounds.length);
+  const kd = me.deaths ? me.kills / me.deaths : me.kills;
+  const diff = me.kills - me.deaths;
+  const big = (i, label, html, sub, fill, tip) =>
+    `<div class="big" style="--i:${i + 3};--f:${Math.max(0.02, Math.min(1, fill)).toFixed(3)}" title="${esc(tip)}"><span class="lbl">${label}</span>${html}<em>${sub}</em><i class="meter"><i></i></i></div>`;
+  const kda = `<div class="kda">${num(me.kills)}<span>/</span>${num(me.deaths)}<span>/</span>${num(me.assists)}</div>`;
+  const cells = [
+    ["Headshot", num(me.hs, { suffix: "%" }), "Part des balles touchées à la tête"],
+    ["DDΔ / manche", num(me.ddelta, { sign: true, cls: me.ddelta >= 0 ? "good" : "bad" }), "Dégâts infligés moins dégâts reçus, par manche"],
+    ["Kills / manche", num(me.kills / rounds, { d: 2 }), "Kills en moyenne par manche"],
+    ["Place (ACS)", `<b>#${place}<small> / ${all.length}</small></b>`, "Classement au score de combat parmi tous les joueurs"],
+    ["First bloods", num(me.firstBloods, { cls: me.firstBloods ? "good" : "" }), "Premier kill de la manche"],
+    ["First deaths", num(me.firstDeaths, { cls: me.firstDeaths ? "bad" : "" }), "Premier mort de la manche"],
+    ["Multi-kills", num(me.multikills), "Manches avec au moins 3 ennemis différents tués"],
+    ["Aces", num(me.aces, { cls: me.aces ? "gold" : "" }), "Manches où tu as tué les 5 ennemis"],
+    ["Clutchs", num(me.clutches, { cls: me.clutches ? "gold" : "" }), "Manches gagnées en clutch (reconnues par Riot)"],
+    ["Econ rating", num(me.econ), "Dégâts infligés pour 1 000 crédits dépensés"],
+    ["Spikes posés", num(me.plants), "Spikes posés"],
+    ["Désamorçages", num(me.defuses), "Spikes désamorcés"],
+  ];
+  return `
+    <section class="rs-stats">
+      <div class="bigs">
+        ${big(0, "Score de combat", num(me.acs), `${me.score.toLocaleString("fr-FR")} points au total`, me.acs / 400, "ACS : score de combat moyen par manche")}
+        ${big(1, "K / D / A", kda, `K/D ${fmt(kd, 2)} · ${signed(diff)}`, kd / 2, "Kills / morts / assists")}
+        ${big(2, "KAST", num(me.kast, { suffix: "%" }), "Kill, assist, survie ou échange", me.kast / 100, "Manches avec un kill, une assist, une survie ou une mort vengée")}
+        ${big(3, "Dégâts / manche", num(me.adr), `${me.damage.toLocaleString("fr-FR")} dégâts`, me.adr / 250, "ADR : dégâts infligés en moyenne par manche")}
+      </div>
+      <div class="grid rs-grid">${cells
+        .map(([l, v, tip], i) => `<div class="cell" style="--i:${i + 7}" title="${esc(tip)}"><span class="lbl">${l}</span>${v}</div>`)
+        .join("")}</div>
+    </section>`;
+}
+
+/** Score de combat de chaque manche : barres (manche gagnée / perdue), kills et cérémonies. */
+function resultRounds(me, d, mine) {
+  const scores = me.roundScores || [];
+  if (d.rounds.length < 2 || !scores.some((s) => s > 0)) return "";
+  const kills = me.roundKills || [];
+  const top = Math.max(600, ...scores);
+  const best = scores.indexOf(Math.max(...scores));
+  const bars = d.rounds
+    .map((r, i) => {
+      const won = r.winner === mine.teamId;
+      const s = scores[i] || 0;
+      const k = kills[i] || 0;
+      const tag = r.player === me.puuid && CEREMONIES[r.ceremony] ? CEREMONIES[r.ceremony] : k >= 3 ? `${k}K` : "";
+      const sep = i === 12 ? `<i class="rb-half" title="Mi-temps"></i>` : i === 24 ? `<i class="rb-half" title="Prolongation"></i>` : "";
+      const tip = `Manche ${i + 1} · ${won ? "gagnée" : "perdue"} (${ROUND_LABELS[r.result] || r.result})\n${s} points · ${k} kill${k > 1 ? "s" : ""}`;
+      return `${sep}<div class="rb ${won ? "w" : "l"}${i === best ? " best" : ""}" style="--h:${(s / top).toFixed(3)};--i:${i}" title="${esc(tip)}">
+        <div class="rb-col">${tag ? `<em>${tag}</em>` : ""}<b>${s || ""}</b><i></i></div><span>${i + 1}</span></div>`;
+    })
+    .join("");
+  return `
+    <section class="rs-rounds">
+      <div class="rs-sec"><span class="lbl">Score de combat par manche</span><em>Moyenne <b>${me.acs}</b> · Meilleure manche <b>${scores[best]}</b> (manche ${best + 1})</em></div>
+      <div class="rb-plot" style="--avg:${(me.acs / top).toFixed(3)}"><i class="rb-avg"><span>ACS ${me.acs}</span></i>${bars}</div>
+    </section>`;
+}
+
+function viewResult(v) {
+  const r = v.data;
+  const d = r.detail;
+  const bar = `<div class="career-bar">${BACK_BTN}<span class="tabs-note">Résultat de la partie</span></div>`;
+  const me = d.teams.flatMap((t) => t.players).find((p) => p.puuid === r.puuid);
+  if (!me) return `${bar}<div class="c-msg">Résultat indisponible</div>`;
+  const mine = d.teams.find((t) => t.players.includes(me));
+  const them = d.teams.find((t) => t !== mine);
+  const board = d.teams.length > 2
+    ? matchTeams(v, { ...d, teams: [{ ...mine, players: d.teams.flatMap((t) => t.players).sort((a, b) => b.kills - a.kills) }] })
+    : matchTeams(v, d);
+  return `${bar}<div class="rs">
+    ${resultHero(r, d, me, mine, them)}
+    <div class="rs-main${me.medal && d.perfScale ? "" : " no-medal"}">${resultMedal(me, d.perfScale)}${resultStats(me, d)}</div>
+    ${resultRounds(me, d, mine)}
+    <div class="rs-board"><div class="rs-sec"><span class="lbl">Tableau des scores</span></div>${board}</div>
+  </div>`;
+}
+
+/** Bandeau « Dernière partie » du salon. */
+function lastResultCard() {
+  const r = app.demo ? window.DEMO?.result(app.assets, currentSnap()) : app.result;
+  const d = r?.detail;
+  const me = d?.teams.flatMap((t) => t.players).find((p) => p.puuid === r.puuid);
+  if (!me) return "";
+  const mine = d.teams.find((t) => t.players.includes(me));
+  const them = d.teams.find((t) => t !== mine);
+  const draw = d.teams.length === 2 && them.roundsWon === mine.roundsWon;
+  const cls = draw ? "draw" : mine.won ? "win" : "loss";
+  const map = mapById(d.mapId);
+  const stat = (label, html) => `<div class="lr-stat"><span class="lbl">${label}</span>${html}</div>`;
+  return `
+    <div class="last-res ${cls}" data-act="result" style="--i:6">
+      <div class="lr-bg" style="background-image:url('${esc(map?.splash || "")}')"></div>
+      <div class="lr-l"><span class="lbl">Dernière partie · ${esc(timeAgo(d.startMs + (d.lengthMs || 0)))}</span><b>${draw ? "Égalité" : mine.won ? "Victoire" : "Défaite"}</b><em>${esc(map?.name || "")} · ${esc(QUEUES[d.queueId] || d.queueId || "Partie")}</em></div>
+      ${d.teams.length === 2 ? `<div class="lr-score"><b class="good">${mine.roundsWon}</b><span>:</span><b class="bad">${them.roundsWon}</b></div>` : ""}
+      ${me.medal ? stat("Médaille", `<b class="lr-medal m-${esc(me.medal)}"><i></i>${(MEDALS[me.medal] || MEDALS.pass).label}</b>`) : ""}
+      ${stat("ACS", `<b>${me.acs}</b>`)}
+      ${stat("K / D / A", `<b>${me.kills} / ${me.deaths} / ${me.assists}</b>`)}
+      ${r.rr ? stat("RR", `<b class="${r.rr.earned >= 0 ? "good" : "bad"}">${signed(r.rr.earned)}</b>`) : ""}
+      <span class="lr-go">Voir le résultat<svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+    </div>`;
+}
+
+function openResult(r) {
+  r ||= app.demo || !TAURI ? window.DEMO?.result(app.assets, currentSnap()) : app.result;
+  if (!r) return;
+  app.resultPending = false;
+  if (app.view?.kind === "result" && app.view.data.detail.matchId === r.detail.matchId) return;
+  pushView({ kind: "result", data: r, perspective: r.puuid });
+  countUp($("#view"));
 }
 
 /** Compteurs : de 0 à la valeur finale, une seule boucle requestAnimationFrame (~0,7 s). */
@@ -1104,7 +1396,8 @@ function playerFor(puuid) {
   const live = currentSnap()?.players.find((p) => p.puuid === puuid);
   if (live) return live;
   const v = app.view;
-  const line = v?.kind === "match" && v.data?.teams.flatMap((t) => t.players).find((p) => p.puuid === puuid);
+  const detail = v?.kind === "match" ? v.data : v?.kind === "result" ? v.data.detail : null;
+  const line = detail?.teams.flatMap((t) => t.players).find((p) => p.puuid === puuid);
   if (!line) return null;
   const me = currentSnap()?.players.find((p) => p.isMe);
   const known = knownName(puuid, line);
@@ -1396,8 +1689,8 @@ function renderHeader(s) {
   $("#status").innerHTML = `<span class="pill ${cls}"><i></i>${esc(label)}</span>`;
 
   const v = app.view;
-  const focusAgent = v?.kind === "match"
-    ? v.data?.teams.flatMap((t) => t.players).find((p) => p.puuid === v.perspective)?.agentId
+  const focusAgent = v?.kind === "match" || v?.kind === "result"
+    ? (v.kind === "result" ? v.data.detail : v.data)?.teams.flatMap((t) => t.players).find((p) => p.puuid === v.perspective)?.agentId
     : (v?.player || s.players.find((p) => p.isMe))?.agentId;
   const bgAgent = agent(focusAgent) || agent(v?.data?.agents?.[0]?.agentId) || agent(DEFAULT_BG_AGENT);
   const img = $("#bgAgent");
@@ -1415,7 +1708,7 @@ function render() {
   if (root.classList.contains("enter")) root.style.setProperty("--ea", `-${Math.round(performance.now() - app.enterAt)}ms`);
   renderHeader(s);
   let html;
-  if (app.view) html = app.view.kind === "match" ? viewMatch(app.view) : viewCareer(app.view);
+  if (app.view) html = app.view.kind === "match" ? viewMatch(app.view) : app.view.kind === "result" ? viewResult(app.view) : viewCareer(app.view);
   else {
     switch (s.phase) {
       case "ingame": html = viewIngame(s); break;
@@ -1547,6 +1840,7 @@ function bindUi() {
     else if (el.dataset.actId) selectAct(el.dataset.actId);
     else if (el.dataset.act === "cur-act" && app.view?.kind === "career") switchScope(app.view, { actId: null });
     else if (el.dataset.act === "back") goBack();
+    else if (el.dataset.act === "result") openResult();
     else if (el.dataset.act === "more") showMoreRows();
     else if (el.dataset.queue && app.view?.kind === "career") {
       const comp = el.dataset.queue === "comp";
@@ -1623,6 +1917,14 @@ async function main() {
       const el = v?.kind === "match" && v.id === e.payload.matchId && $("#mdbody");
       if (el) el.innerHTML = matchBody(v);
     });
+    // Partie terminée : écran de fin de partie (tout de suite si l'overlay est ouvert sur la partie)
+    app.result = await invoke("get_last_result").catch(() => null);
+    await listen("match-result", (e) => {
+      app.result = e.payload;
+      if (app.demo) return;
+      if (app.visible && !app.view) return openResult(e.payload);
+      app.resultPending = true;
+    });
     await listen("career-progress", (e) => {
       const v = app.view;
       app.careerApplies.get(e.payload.request)?.(e.payload.career);
@@ -1633,7 +1935,18 @@ async function main() {
         clearInterval(app.timer);
         return;
       }
-      if (app.dirty) {
+      if (app.resultPending && app.result && !app.demo) {
+        // Partie terminée pendant que l'overlay était masqué : il s'ouvre sur le résultat
+        app.resultPending = false;
+        if (app.view?.kind !== "result" || app.view.data.detail.matchId !== app.result.detail.matchId) {
+          if (app.view) app.stack.push(app.view);
+          app.view = { kind: "result", data: app.result, perspective: app.result.puuid };
+          $("#view").scrollTop = 0;
+        }
+        app.dirty = false;
+        render();
+        countUp($("#view"));
+      } else if (app.dirty) {
         app.dirty = false;
         if (app.view) renderHeader(app.snap);
         else render();
@@ -1663,7 +1976,8 @@ async function main() {
 
   // Aperçu navigateur (captures d'écran) : ?open=career ou ?open=match ouvre directement la vue
   const open = !TAURI && new URLSearchParams(location.search).get("open");
-  if (open) {
+  if (open === "result") openResult();
+  else if (open) {
     const first = currentSnap()?.players.find((p) => p.isMe) || currentSnap()?.players[0];
     if (first) openCareer(first.puuid);
     if (open === "match") {
