@@ -171,7 +171,7 @@ function wrBlock(r) {
 
 function nameBlock(p) {
   const a = agent(p.agentId);
-  const dot = p.party != null ? `<i class="pdot" style="--pc:${PARTY_COLORS[p.party % PARTY_COLORS.length]}" title="En groupe"></i>` : "";
+  const dot = p.party != null ? `<i class="pdot" style="--pc:${PARTY_COLORS[p.party % PARTY_COLORS.length]}" title="${p.partyGuess ? "Groupe probable (ensemble à leur dernier match)" : "En groupe"}"></i>` : "";
   const name = p.name
     ? `<span class="n">${esc(p.name)}</span><span class="tag">#${esc(p.tag)}</span>`
     : `<span class="n hidden">${esc(a?.name || "Joueur")}</span><span class="tag">${p.incognito || hiddenLive(p.puuid) ? "masqué" : "anonyme"}</span>`;
@@ -275,7 +275,9 @@ function partyBrackets(list, offset) {
     while (g != null && j + 1 < list.length && list[j + 1].party === g) j++;
     if (g != null && j > i) {
       const c = PARTY_COLORS[g % PARTY_COLORS.length];
-      html += `<i class="bracket" style="--s:${i};--n:${j - i + 1};--pc:${c};--i:${offset + i}" title="Groupe de ${j - i + 1}"><b></b></i>`;
+      const guess = list.slice(i, j + 1).some((p) => p.partyGuess);
+      const title = guess ? `Groupe probable de ${j - i + 1} : ensemble à leur dernier match` : `Groupe de ${j - i + 1}`;
+      html += `<i class="bracket" style="--s:${i};--n:${j - i + 1};--pc:${c};--i:${offset + i}" title="${title}"><b></b></i>`;
     }
     i = j + 1;
   }

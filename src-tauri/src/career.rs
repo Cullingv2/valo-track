@@ -743,6 +743,57 @@ async fn with_medals(riot: &Riot, cache: &CareerCache, id: &str, old: Arc<Parsed
     cache.put(id, fresh)
 }
 
+/// Groupes probables d'une partie en cours. Riot ne montre les groupes que de tes amis ; mais un
+/// joueur qui était dans le même groupe qu'un coéquipier actuel lors de son dernier match joue
+/// presque toujours encore avec lui (mesuré sur de vrais matchs : 12 groupes justes, 0 faux).
+/// Chaque joueur est analysé l'un après l'autre (dernier match chez Riot, sinon HenrikDev) et le
+/// résultat est ajouté au fur et à mesure : la boucle de suivi l'affiche à son passage suivant.
+pub fn spawn_party_hints(app: AppHandle, riot: Arc<Riot>, cache: Arc<CareerCache>, shared: Arc<Shared>, match_id: String, puuids: Vec<String>) {
+    tauri::async_runtime::spawn(async move {
+        let started = Instant::now();
+        let mut linked = 0;
+        let mut failed = 0;
+        for puuid in &puuids {
+            let mates = last_party(&riot, &cache, puuid).await;
+            match &mates {
+                Some(m) => linked += (!m.is_empty()) as u32,
+                None => failed += 1,
+            }
+            shared.set_party_hint(&match_id, puuid, mates);
+        }
+        crate::tracker::diag(
+            &app,
+            &format!("groupes probables : {} joueur(s) analysé(s) en {:.1} s, {linked} en groupe au dernier match, {failed} sans réponse", puuids.len(), started.elapsed().as_secs_f32()),
+        );
+    });
+}
+
+/// Coéquipiers de groupe d'un joueur lors de son dernier match (vide : il jouait seul).
+async fn last_party(riot: &Riot, cache: &CareerCache, puuid: &str) -> Option<Vec<String>> {
+    let region = cache.people.region_for(puuid, &riot.region());
+    let path = format!("/match-history/v1/history/{puuid}?startIndex=0&endIndex=1");
+    let mut id = match cache.pd_page(riot, &path, Duration::from_secs(3)).await {
+        Ok(Some(v)) => v["History"][0]["MatchID"].as_str().map(String::from),
+        _ => None,
+    };
+    if id.is_none() && cache.henrik.available() {
+        // Riot limite les requêtes : dernier match connu de HenrikDev (relais)
+        let v = cache.henrik.try_get(&format!("valorant/v1/by-puuid/stored-matches/{region}/{puuid}?size=3")).await;
+        id = v.and_then(|v| {
+            let list = v["data"].as_array()?.clone();
+            let newest = list.iter().max_by_key(|m| m["meta"]["started_at"].as_str().and_then(crate::tracker::iso_ms).unwrap_or(0))?;
+            newest["meta"]["id"].as_str().map(String::from)
+        });
+    }
+    let id = id?;
+    let m = tokio::time::timeout(Duration::from_secs(25), match_cached(riot, cache, &id, &region, false)).await.ok()?.ok()??;
+    let party = &m.players.get(puuid)?.party_id;
+    if party.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(m.players.iter().filter(|(q, p)| *q != puuid && p.party_id == *party).map(|(q, _)| q.clone()).collect())
+}
+
 /// Écran de fin de partie : le match qui vient de se terminer, vu par le joueur.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -2841,5 +2892,46 @@ mod tests {
                 assert!(rr.tier_after > 0);
             }
         });
+    }
+
+    /// Groupes au dernier match des joueurs de mon dernier match (session Riot locale, lecture seule) :
+    /// pour ceux qui n'ont pas rejoué depuis, le résultat doit être exactement leur groupe de ce match.
+    /// `cargo test real_party_hints -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_party_hints() {
+        let dir = std::env::temp_dir().join(format!("valo-party-{}", std::process::id()));
+        let cfg = crate::config::Config::default();
+        let cache = CareerCache::new(Some(dir.clone()), Arc::new(Henrik::new(&cfg)), Arc::new(Directory::new(None)));
+        let riot = Riot::new();
+        tauri::async_runtime::block_on(async {
+            riot.ensure().await.unwrap();
+            let me = riot.puuid();
+            // VALO_MATCH_INDEX : match plus ancien (ceux qui ont rejoué depuis sont alors comptés à part)
+            let index: usize = std::env::var("VALO_MATCH_INDEX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let hist = riot.pd(&format!("/match-history/v1/history/{me}?startIndex={index}&endIndex={}", index + 1)).await.unwrap().unwrap();
+            let id = hist["History"][0]["MatchID"].as_str().unwrap().to_string();
+            let m = match_cached(&riot, &cache, &id, "eu", false).await.unwrap().unwrap();
+            let t0 = Instant::now();
+            let (mut same, mut checked) = (0, 0);
+            for (p, st) in &m.players {
+                let last = riot.pd(&format!("/match-history/v1/history/{p}?startIndex=0&endIndex=1")).await.ok().flatten();
+                if last.as_ref().and_then(|v| v["History"][0]["MatchID"].as_str()) != Some(id.as_str()) {
+                    println!("{} : a rejoué depuis, ignoré", &p[..8]);
+                    continue;
+                }
+                let mates = last_party(&riot, &cache, p).await;
+                let mut truth: Vec<String> = m.players.iter().filter(|(q, s)| *q != p && s.party_id == st.party_id).map(|(q, _)| q.clone()).collect();
+                let mut got = mates.clone().unwrap_or_default();
+                truth.sort();
+                got.sort();
+                checked += 1;
+                same += (got == truth) as u32;
+                println!("{} : {} coéquipier(s) de groupe (réel {}){}", &p[..8], got.len(), truth.len(), if mates.is_none() { " — sans réponse" } else { "" });
+            }
+            println!("{same} / {checked} identiques au groupe réel, {:.1} s", t0.elapsed().as_secs_f32());
+            assert!(same * 10 >= checked * 7, "trop d'écarts");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

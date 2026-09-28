@@ -57,6 +57,8 @@ pub struct PlayerView {
     pub level: Option<u32>,
     pub card_id: Option<String>,
     pub party: Option<u32>,
+    /// Groupe probable (même groupe lors du dernier match), pas confirmé par Riot
+    pub party_guess: bool,
     /// `None` = en cours de chargement
     pub rank: Option<RankInfo>,
 }
@@ -124,6 +126,18 @@ pub struct Shared {
     snapshot: Mutex<Snapshot>,
     /// Actes connus (content-service), pour nommer les saisons et calculer les pics.
     content: Mutex<Content>,
+    /// Groupes probables de la partie en cours (voir `career::spawn_party_hints`)
+    hints: Mutex<PartyHints>,
+}
+
+/// Pour chaque joueur de la partie : ses coéquipiers de groupe lors de son dernier match.
+#[derive(Default)]
+struct PartyHints {
+    match_id: String,
+    mates: HashMap<String, Vec<String>>,
+    pending: HashSet<String>,
+    /// Joueurs sans réponse : nouvel essai après 30 s
+    failed: HashMap<String, Instant>,
 }
 
 #[derive(Default, Clone)]
@@ -135,6 +149,40 @@ struct Content {
 impl Shared {
     pub fn phase(&self) -> Phase {
         self.snapshot.lock().unwrap().phase
+    }
+
+    /// Résultat pour un joueur (ignoré si la partie a changé entre-temps).
+    pub fn set_party_hint(&self, match_id: &str, puuid: &str, mates: Option<Vec<String>>) {
+        let mut h = self.hints.lock().unwrap();
+        if h.match_id != match_id {
+            return;
+        }
+        h.pending.remove(puuid);
+        match mates {
+            Some(mates) => {
+                h.mates.insert(puuid.to_string(), mates);
+            }
+            None => {
+                h.failed.insert(puuid.to_string(), Instant::now());
+            }
+        }
+    }
+
+    /// Joueurs encore à analyser pour cette partie (marqués « en cours »).
+    fn claim_party_hints(&self, match_id: &str, puuids: Vec<String>) -> Vec<String> {
+        let mut h = self.hints.lock().unwrap();
+        if h.match_id != match_id {
+            *h = PartyHints { match_id: match_id.to_string(), ..Default::default() };
+        }
+        let retry_later = |p: &String| h.failed.get(p).is_some_and(|t| t.elapsed() < Duration::from_secs(30));
+        let todo: Vec<String> = puuids.into_iter().filter(|p| !h.mates.contains_key(p) && !h.pending.contains(p) && !retry_later(p)).collect();
+        h.pending.extend(todo.iter().cloned());
+        todo
+    }
+
+    fn party_mates(&self, match_id: &str) -> HashMap<String, Vec<String>> {
+        let h = self.hints.lock().unwrap();
+        if h.match_id == match_id { h.mates.clone() } else { HashMap::new() }
     }
 
     pub fn act_name(&self, id: &str) -> Option<String> {
@@ -350,6 +398,8 @@ struct Tracker {
     ranks: HashMap<String, (Instant, RankInfo)>,
     names: HashMap<String, (String, String)>,
     core_match: Option<(String, Value)>,
+    /// Partie dont les groupes probables sont affichés
+    hints_match: Option<String>,
     party_for: Option<String>,
     own_party: OwnParty,
     backoff_until: Option<Instant>,
@@ -371,6 +421,7 @@ impl Tracker {
             ranks: HashMap::new(),
             names: HashMap::new(),
             core_match: None,
+            hints_match: None,
             party_for: None,
             own_party: OwnParty::default(),
             backoff_until: None,
@@ -582,6 +633,7 @@ impl Tracker {
             })
             .collect();
 
+        self.request_party_hints(&match_id, &raws, party_of);
         let snap = Snapshot {
             phase: Phase::Ingame,
             map_id: m["MapID"].as_str().map(String::from),
@@ -589,8 +641,26 @@ impl Tracker {
             provisioning_flow: m["ProvisioningFlow"].as_str().map(String::from),
             ..Default::default()
         };
+        self.hints_match = Some(match_id);
         self.enrich_and_publish(snap, raws, party_of, true).await;
         Ok(true)
+    }
+
+    /// Groupes que Riot ne montre pas (joueurs qui ne sont pas tes amis) : déduits en arrière-plan
+    /// du dernier match de chaque joueur. Toi, ton groupe et tes amis sont déjà connus.
+    fn request_party_hints(&mut self, match_id: &str, raws: &[RawPlayer], party_of: &HashMap<String, String>) {
+        let me = self.riot.puuid();
+        let unknown: Vec<String> = raws
+            .iter()
+            .map(|r| r.puuid.clone())
+            .filter(|p| *p != me && !self.own_party.members.contains(p) && !party_of.contains_key(p))
+            .collect();
+        let todo = self.shared.claim_party_hints(match_id, unknown);
+        if todo.is_empty() {
+            return;
+        }
+        let cache = self.app.state::<Arc<crate::career::CareerCache>>().inner().clone();
+        crate::career::spawn_party_hints(self.app.clone(), self.riot.clone(), cache, self.shared.clone(), match_id.to_string(), todo);
     }
 
     async fn pregame(&mut self, party_of: &HashMap<String, String>) -> anyhow::Result<bool> {
@@ -603,6 +673,7 @@ impl Tracker {
 
         let team = &m["AllyTeam"];
         let team_id = team["TeamID"].as_str().unwrap_or("").to_string();
+        self.hints_match = Some(match_id.clone());
         let raws: Vec<RawPlayer> = team["Players"]
             .as_array()
             .into_iter()
@@ -618,6 +689,7 @@ impl Tracker {
             })
             .collect();
 
+        self.request_party_hints(&match_id, &raws, party_of);
         let ends_at = m["PhaseTimeRemainingNS"].as_f64().map(|ns| now_ms() + (ns / 1e6) as u64);
         let snap = Snapshot {
             phase: Phase::Pregame,
@@ -747,7 +819,10 @@ impl Tracker {
             }
         }
 
-        let groups = if show_parties { self.party_groups(&raws, party_of) } else { HashMap::new() };
+        if !show_parties {
+            self.hints_match = None;
+        }
+        let (groups, guessed) = if show_parties { self.party_groups(&raws, party_of) } else { Default::default() };
         if show_parties {
             let seen = raws.iter().filter(|r| party_of.contains_key(&r.puuid)).count();
             let mut sizes: HashMap<u32, u32> = HashMap::new();
@@ -757,15 +832,16 @@ impl Tracker {
             let mut sizes: Vec<u32> = sizes.into_values().collect();
             sizes.sort_unstable_by(|a, b| b.cmp(a));
             self.log(format!(
-                "{:?} : {} joueurs, présence connue pour {}, ton groupe {} membre(s), groupes détectés {:?}",
+                "{:?} : {} joueurs, présence connue pour {}, ton groupe {} membre(s), groupes détectés {:?} (dont {} joueur(s) d'après leur dernier match)",
                 snap.phase,
                 raws.len(),
                 seen,
                 self.own_party.members.len(),
-                sizes
+                sizes,
+                guessed.len()
             ));
         }
-        snap.players = raws.iter().map(|r| self.view(r, &me, &my_team, &groups)).collect();
+        snap.players = raws.iter().map(|r| self.view(r, &me, &my_team, &groups, &guessed)).collect();
         self.publish(snap.clone());
 
         // Rangs, un par un pour ménager la limite de requêtes ; l'interface se remplit au fur et à mesure.
@@ -801,7 +877,7 @@ impl Tracker {
         }
     }
 
-    fn view(&self, r: &RawPlayer, me: &str, my_team: &str, groups: &HashMap<String, u32>) -> PlayerView {
+    fn view(&self, r: &RawPlayer, me: &str, my_team: &str, groups: &HashMap<String, u32>, guessed: &HashSet<String>) -> PlayerView {
         let id = &r.identity;
         let is_me = r.puuid == me;
         let known = is_me || self.own_party.members.contains(&r.puuid);
@@ -825,19 +901,26 @@ impl Tracker {
             level: id["AccountLevel"].as_u64().filter(|l| *l > 0 && !hide_level).map(|l| l as u32),
             card_id: id["PlayerCardID"].as_str().filter(|s| !s.is_empty()).map(String::from),
             party: groups.get(&r.puuid).copied(),
+            party_guess: guessed.contains(&r.puuid),
             rank: self.ranks.get(&r.puuid).map(|(_, rk)| rk.clone()),
         }
     }
 
     /// Numérote les groupes (≥ 2 joueurs dans la partie). Ton groupe = 0.
-    fn party_groups(&self, raws: &[RawPlayer], party_of: &HashMap<String, String>) -> HashMap<String, u32> {
-        let pid = |p: &str| -> Option<String> {
+    /// Groupes connus (ton groupe, tes amis) + groupes probables (même groupe au dernier match,
+    /// même équipe maintenant). Renvoie aussi les joueurs dont le groupe est seulement probable.
+    fn party_groups(&self, raws: &[RawPlayer], party_of: &HashMap<String, String>) -> (HashMap<String, u32>, HashSet<String>) {
+        let known = |p: &str| -> Option<String> {
             if self.own_party.members.contains(p) {
                 self.own_party.id.clone()
             } else {
                 party_of.get(p).cloned()
             }
         };
+        let players: Vec<(String, String, Option<String>)> = raws.iter().map(|r| (r.puuid.clone(), r.team.clone(), known(&r.puuid))).collect();
+        let mates = self.hints_match.as_deref().map(|m| self.shared.party_mates(m)).unwrap_or_default();
+        let (root, mut guessed) = merge_hints(&players, self.own_party.id.as_deref(), &mates);
+        let pid = |p: &str| -> Option<String> { root.get(p).cloned() };
         let mut count: HashMap<String, u32> = HashMap::new();
         for r in raws {
             if let Some(id) = pid(&r.puuid) {
@@ -857,13 +940,16 @@ impl Tracker {
                 }
             }
         }
-        raws.iter()
+        let groups: HashMap<String, u32> = raws
+            .iter()
             .filter_map(|r| {
                 let id = pid(&r.puuid)?;
                 let idx = order.iter().position(|o| *o == id)?;
                 Some((r.puuid.clone(), idx as u32))
             })
-            .collect()
+            .collect();
+        guessed.retain(|p| groups.contains_key(p));
+        (groups, guessed)
     }
 
     async fn fetch_rank(&mut self, puuid: &str) -> anyhow::Result<RankInfo> {
@@ -885,6 +971,37 @@ impl Tracker {
         let v = henrik.try_get(&format!("valorant/v3/by-puuid/mmr/{region}/pc/{puuid}")).await?;
         Some(henrik_rank(&v["data"], self.current_act.as_deref(), &self.acts).rank)
     }
+}
+
+/// Clé de groupe de chaque joueur : groupe connu (ton groupe, tes amis), sinon lui-même, puis
+/// fusion des joueurs d'une même équipe qui étaient ensemble à leur dernier match. Ton groupe est
+/// connu exactement (personne n'y est ajouté) et deux groupes connus ne sont jamais fusionnés.
+/// Renvoie aussi les joueurs rattachés seulement par déduction.
+fn merge_hints(players: &[(String, String, Option<String>)], own: Option<&str>, mates: &HashMap<String, Vec<String>>) -> (HashMap<String, String>, HashSet<String>) {
+    let mut root: HashMap<String, String> = players.iter().map(|(p, _, k)| (p.clone(), k.clone().unwrap_or_else(|| p.clone()))).collect();
+    let team: HashMap<&str, &str> = players.iter().map(|(p, t, _)| (p.as_str(), t.as_str())).collect();
+    let known: HashSet<&str> = players.iter().filter_map(|(_, _, k)| k.as_deref()).collect();
+    let mut guessed = HashSet::new();
+    // Ordre fixe : même résultat à chaque passage de la boucle de suivi
+    let mut list: Vec<(&String, &Vec<String>)> = mates.iter().collect();
+    list.sort();
+    for (p, qs) in list {
+        for q in qs.iter().filter(|q| team.contains_key(q.as_str()) && team.get(q.as_str()) == team.get(p.as_str())) {
+            let (Some(a), Some(b)) = (root.get(p).cloned(), root.get(q).cloned()) else { continue };
+            let (ka, kb) = (known.contains(a.as_str()), known.contains(b.as_str()));
+            if a == b || (ka && kb) || own.is_some_and(|o| a == o || b == o) {
+                continue;
+            }
+            let (from, to) = if kb { (a, b) } else { (b, a) };
+            for v in root.values_mut().filter(|v| **v == from) {
+                *v = to.clone();
+            }
+            guessed.insert(p.clone());
+            guessed.insert(q.clone());
+        }
+    }
+    guessed.retain(|p| players.iter().any(|(id, _, k)| id == p && k.is_none()));
+    (root, guessed)
 }
 
 fn parse_mmr(v: &Value, current: Option<&str>, acts: &HashMap<String, Act>) -> RankInfo {
@@ -1105,6 +1222,50 @@ mod tests {
         // Ancien système : 20 → 20, 21 (Immortel 1) → 24
         assert_eq!(h[0].wins_by_tier, vec![[20, 3], [24, 5]]);
         assert_eq!((h[1].tier, h[1].games, h[1].wins, h[1].current), (19, 12, 7, true));
+    }
+
+    #[test]
+    fn party_hints_merge() {
+        let s = |x: &str| x.to_string();
+        let p = |id: &str, team: &str, known: Option<&str>| (s(id), s(team), known.map(s));
+        let players = vec![
+            p("me", "Blue", Some("own")),
+            p("mate", "Blue", Some("own")),
+            p("a1", "Blue", None),
+            p("a2", "Blue", None),
+            p("a3", "Blue", None),
+            p("e1", "Red", None),
+            p("e2", "Red", None),
+            p("e3", "Red", Some("friend")),
+            p("e4", "Red", None),
+            p("e5", "Red", None),
+        ];
+        let mates: HashMap<String, Vec<String>> = [
+            // duo d'alliés
+            ("a1", vec!["a2", "x"]),
+            // a3 a joué avec ton coéquipier : ton groupe est connu exactement, rien n'est ajouté
+            ("a3", vec!["mate"]),
+            // trio adverse, relié dans les deux sens
+            ("e1", vec!["e2", "e4"]),
+            ("e2", vec!["e1"]),
+            // e5 a joué avec ton ami (groupe connu) : rattaché à lui
+            ("e5", vec!["e3"]),
+            // même groupe au dernier match mais équipes différentes maintenant : ignoré
+            ("e4", vec!["a3"]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (s(k), v.into_iter().map(s).collect()))
+        .collect();
+        let (root, guessed) = merge_hints(&players, Some("own"), &mates);
+        let same = |a: &str, b: &str| root[a] == root[b];
+        assert!(same("me", "mate") && root["me"] == "own");
+        assert!(same("a1", "a2") && !same("a1", "a3") && !same("a3", "mate"));
+        assert!(same("e1", "e2") && same("e1", "e4") && !same("e1", "e5"));
+        assert!(same("e5", "e3") && root["e3"] == "friend");
+        assert!(!same("e4", "a3"));
+        let mut g: Vec<&str> = guessed.iter().map(|x| x.as_str()).collect();
+        g.sort_unstable();
+        assert_eq!(g, ["a1", "a2", "e1", "e2", "e4", "e5"]);
     }
 
     #[test]

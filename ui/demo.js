@@ -278,6 +278,8 @@ window.DEMO = {
       level: row[3],
       cardId: card(i + (isAlly ? 0 : 5)),
       party: row[6],
+      // Groupe adverse : déduit du dernier match (Riot ne montre que tes amis)
+      partyGuess: !isAlly && row[6] != null,
       rank: row[4],
     });
 
