@@ -2,6 +2,8 @@
 
 Overlay pour Valorant : **Alt+Z** ouvre par-dessus le jeu une fenêtre avec les rangs, le pic, le winrate, le niveau et les groupes des joueurs de ta partie. Un clic sur un joueur ouvre sa **carrière**, en trois parties clairement séparées : **l’acte en cours** (données officielles Riot : rang, RR, parties, winrate, pic de l’acte, placements), **l’historique classé** (rang de fin de chaque acte, pic global, total de parties) et les **statistiques de tout l’acte** (remises à zéro à chaque nouvel acte ; un clic sur un acte de l’historique affiche les siennes). Chaque match n’est téléchargé qu’une fois (cache disque), l’analyse se fait en parallèle et les stats se remplissent au fur et à mesure : pic de l'acte et pic global, victoires / défaites, dégâts par manche, K/D, headshot %, KAST, DDΔ, ACS, KAD, first bloods, manches flawless, aces, graphiques (score de combat par match, victoires / défaites avec l’écart de manches, évolution des RR, avec infobulles), statistiques par agent et par carte. Un clic sur un match ouvre son **détail** : score, manches une à une (élimination, spike, temps), et les 10 joueurs avec rang, K/D/A, K/D, ACS, ADR, HS %, KAST, first bloods / deaths, multi-kills, groupes et MVP. Un clic sur un joueur du match ouvre sa carrière.
 
+Après chaque partie, un **écran de fin de partie** s'ouvre au prochain Alt+Z : victoire ou défaite, RR gagnés ou perdus, la **médaille** donnée par Riot (Distinction, Mérite, Réussite) avec ton score de performance et le détail attaque / soutien, tes stats du match, ton score de combat manche par manche et le tableau des scores. En partie, les **groupes** sont affichés pour les deux équipes : Riot ne donne que ceux de tes amis, les autres sont déduits du dernier match de chaque joueur.
+
 Au démarrage de l'application : une courte intro (le V se dessine, VALO//TRACK, message d'accueil), qu'un clic ou Échap passe. Les animations (intro, transitions, compteurs, jauges) n'utilisent que `transform` / `opacity`, sont jouées une seule fois par action, et peuvent être coupées dans la config.
 
 - **Backend Rust** (Tauri 2) : lit le client Riot local (`lockfile`) et interroge directement les serveurs Valorant avec les jetons de ta session (jeu lancé ou non). Données publiques en complément via HenrikDev (optionnel : clé ou serveur relais).
@@ -10,7 +12,7 @@ Au démarrage de l'application : une courte intro (le V se dessine, VALO//TRACK,
 
 ## Installer
 
-Lance `Valo Overlay_1.2.4_x64-setup.exe` (dans `src-tauri/target/release/bundle/nsis/`). L'installation se fait pour l'utilisateur courant, sans droits administrateur, avec un raccourci dans le menu Démarrer.
+Télécharge la dernière version sur la [page des releases](https://github.com/Cullingv2/valo-track-releases/releases/latest) (`ValoOverlay-x.y.z-setup.exe`, Windows 10/11 64 bits) et lance-la. L'installation se fait pour l'utilisateur courant, sans droits administrateur, avec un raccourci dans le menu Démarrer. Tu peux aussi construire l'installeur toi-même (voir « Développer »).
 
 L'application vit dans la zone de notification (icône V rouge) :
 - clic gauche : afficher / masquer
@@ -65,7 +67,7 @@ cd src-tauri
 cargo run
 ```
 
-Construire l'installeur : `npx @tauri-apps/cli@2 build` à la racine du projet.
+Construire l'installeur : `npx @tauri-apps/cli@2 build` à la racine du projet (ou `cargo tauri build` dans `src-tauri`) ; il sort dans `src-tauri/target/release/bundle/nsis/`. Tests : `cargo test` dans `src-tauri`.
 
 Serveur relais intégré à l'application (optionnel) : copie `src-tauri/.cargo/config.toml.example` en `src-tauri/.cargo/config.toml` et renseigne l'adresse du serveur et son jeton (`VALO_API_SERVER`, `VALO_API_TOKEN`). Ce fichier n'est pas versionné : le jeton n'apparaît jamais dans le code source. Sans lui, l'application fonctionne avec les données Riot (et une éventuelle clé HenrikDev personnelle dans `config.json`).
 
@@ -87,6 +89,14 @@ ui/
 ```
 
 Aperçu du design dans un navigateur : `node tools/gen-dev-assets.mjs ui/dev-assets.json`, sers le dossier `ui/` avec un serveur statique, puis ouvre `index.html?phase=ingame` (ou `pregame`, `menus`, `waiting`).
+
+## Contribuer
+
+Les issues et les pull requests sont les bienvenues : bug, idée, stat qui te semble fausse (avec l'identifiant du match si possible). Le projet vise Windows uniquement (c'est la seule plateforme de Valorant).
+
+## Licence
+
+Code sous licence [MIT](LICENSE) : tu peux l'utiliser, le modifier et le redistribuer librement, en gardant la mention de copyright.
 
 ## Mentions légales
 
