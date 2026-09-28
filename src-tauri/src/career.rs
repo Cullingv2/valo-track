@@ -34,12 +34,14 @@ const EXCLUDED_QUEUES: &[&str] = &["deathmatch", "hurm", "ggteam", "snowball", "
 /// Patience maximale pour un même appel quand Riot limite les requêtes : ensuite, on passe au suivant.
 const PATIENCE: Duration = Duration::from_secs(10 * 60);
 /// Premier affichage d'une carrière : on n'attend pas Riot plus que ça (le reste suit en fond).
-const FIRST_PASS: Duration = Duration::from_secs(4);
+const FIRST_PASS: Duration = Duration::from_millis(2500);
 /// Budgets de temps d'un chargement de carrière : quoi qu'il arrive (Riot qui limite, quota du
 /// relais épuisé), les stats s'affichent au bout de ~30 s au plus avec ce qui est disponible.
-const SUMMARY_BUDGET: Duration = Duration::from_secs(8);
+const SUMMARY_BUDGET: Duration = Duration::from_secs(5);
 const HISTORY_RETRY_BUDGET: Duration = Duration::from_secs(8);
-const DETAILS_BUDGET: Duration = Duration::from_secs(20);
+const DETAILS_BUDGET: Duration = Duration::from_secs(7);
+/// Plus aucun match reçu depuis ce délai (et la majorité prête) : on affiche sans attendre la fin.
+const DETAILS_STALL: Duration = Duration::from_millis(1200);
 /// Attente maximale des matchs sans résumé avant d'afficher les stats principales
 const MAIN_BUDGET: Duration = Duration::from_millis(1500);
 /// Pages d'historique parcourues au plus (20 matchs par page).
@@ -429,6 +431,9 @@ pub struct Career {
     /// Stats principales prêtes (liste des matchs complète) : affichables tout de suite, elles ne
     /// changent plus ; seules les stats détaillées arrivent ensuite (`done`).
     pub main_ready: bool,
+    /// Matchs dont le détail n'est pas encore arrivé : téléchargés en arrière-plan ensuite
+    #[serde(skip)]
+    pub pending: Vec<String>,
     /// Vrai si des matchs n'ont pas pu être lus (liste partielle)
     pub partial: bool,
     /// Matchs illisibles malgré les nouvelles tentatives
@@ -657,6 +662,22 @@ pub async fn get_career(
         Err(e) => format!("carrière {} : erreur {e:#}", &puuid[..8.min(puuid.len())]),
     };
     crate::tracker::diag(&app, &line);
+    if let Ok(c) = &res {
+        if !c.pending.is_empty() {
+            let (riot, cache, pending) = (riot.inner().clone(), cache.inner().clone(), c.pending.clone());
+            tauri::async_runtime::spawn(async move {
+                let _ = stream::iter(pending.into_iter().enumerate())
+                    .map(|(i, id)| {
+                        let (riot, cache, region) = (&riot, &cache, &region);
+                        async move { match_cached(riot, cache, &id, region, i % 2 == 1).await }
+                    })
+                    .buffer_unordered(3)
+                    .collect::<Vec<_>>()
+                    .await;
+                cache.flush();
+            });
+        }
+    }
     res.map_err(|e| format!("{e:#}"))
 }
 
@@ -686,39 +707,58 @@ pub async fn get_match(
         Ok(None) => return Err("match introuvable".into()),
         Err(e) => return Err(format!("{e:#}")),
     };
-    let parsed = with_medals(&riot, &cache, &match_id, parsed).await;
     let act = shared.act_name(&parsed.season_id);
-    if !parsed.players.values().any(|p| p.name.is_empty()) || !cache.henrik.available() {
-        return Ok(detail(&match_id, &parsed, act));
+    let mut first = detail(&match_id, &parsed, act.clone());
+    fill_tiers(&mut first, &shared, &cache.people);
+    let medals = parsed.rev < PARSE_REV && riot.connected();
+    let names = parsed.players.values().any(|p| p.name.is_empty()) && cache.henrik.available();
+    if !medals && !names {
+        return Ok(first);
     }
-    let (c, id, r, p) = (cache.inner().clone(), match_id.clone(), region.clone(), parsed.clone());
-    let parsed_bg = parsed.clone();
-    let mut task = tauri::async_runtime::spawn(async move { fill_names(&c, &id, &r, &p).await });
-    match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
-        Ok(Ok(Some(named))) => Ok(detail(&match_id, &named, act)),
-        Ok(_) => {
-            crate::tracker::diag(&app, &format!("pseudos du match {} : HenrikDev ne les a pas fournis", &match_id[..8.min(match_id.len())]));
-            Ok(detail(&match_id, &parsed, act))
+    // Médailles (match analysé par une ancienne version) et pseudos (HenrikDev) en arrière-plan :
+    // inclus s'ils arrivent en moins de 0,6 s, sinon le match s'affiche et ils suivent (`match-names`).
+    let (riot2, cache2, shared2, app2, id) = (riot.inner().clone(), cache.inner().clone(), shared.inner().clone(), app.clone(), match_id.clone());
+    let mut task = tauri::async_runtime::spawn(async move {
+        let mut p = parsed;
+        if medals {
+            p = with_medals(&riot2, &cache2, &id, p).await;
         }
+        if names {
+            match fill_names(&cache2, &id, &region, &p).await {
+                Some(named) => p = named,
+                None => crate::tracker::diag(&app2, &format!("pseudos du match {} : HenrikDev ne les a pas fournis", &id[..8.min(id.len())])),
+            }
+        }
+        let mut d = detail(&id, &p, act);
+        fill_tiers(&mut d, &shared2, &cache2.people);
+        d
+    });
+    match tokio::time::timeout(Duration::from_millis(600), &mut task).await {
+        Ok(Ok(d)) => Ok(d),
+        Ok(Err(_)) => Ok(first),
         Err(_) => {
-            // Encore en attente : on affiche le match, les pseudos arriveront ensuite.
-            let mut d = detail(&match_id, &parsed, act.clone());
-            d.names_pending = true;
+            first.names_pending = names;
             tauri::async_runtime::spawn(async move {
-                match task.await {
-                    Ok(Some(named)) => {
-                        let d = detail(&match_id, &named, act);
-                        let _ = app.emit("match-names", MatchNames { match_id: &match_id, detail: &d });
-                    }
-                    _ => {
-                        crate::tracker::diag(&app, &format!("pseudos du match {} : HenrikDev ne les a pas fournis", &match_id[..8.min(match_id.len())]));
-                        let d = detail(&match_id, &parsed_bg, act);
-                        let _ = app.emit("match-names", MatchNames { match_id: &match_id, detail: &d });
-                    }
+                if let Ok(d) = task.await {
+                    let _ = app.emit("match-names", MatchNames { match_id: &match_id, detail: &d });
                 }
             });
-            Ok(d)
+            Ok(first)
         }
+    }
+}
+
+/// Parties non classées et combat à mort : Riot n'y donne pas le rang des joueurs (0). On affiche
+/// alors leur rang actuel s'il est connu (lu pendant la session, ou joueur déjà croisé).
+fn fill_tiers(d: &mut MatchDetail, shared: &Shared, people: &Directory) {
+    if d.queue_id == "competitive" {
+        return;
+    }
+    for p in d.teams.iter_mut().flat_map(|t| t.players.iter_mut()).filter(|p| p.tier == 0) {
+        p.tier = match shared.live_tier(&p.puuid) {
+            0 => people.get(&p.puuid).map_or(0, |k| k.tier),
+            t => t,
+        };
     }
 }
 
@@ -882,7 +922,8 @@ pub fn spawn_result(app: AppHandle, riot: Arc<Riot>, cache: Arc<CareerCache>, sh
             }
         }
         let rr = if parsed.queue_id == "competitive" { rr_change(&riot, &me, &match_id).await } else { None };
-        let detail = detail(&match_id, &named, shared.act_name(&parsed.season_id));
+        let mut detail = detail(&match_id, &named, shared.act_name(&parsed.season_id));
+        fill_tiers(&mut detail, &shared, &cache.people);
         let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let medal = named.players.get(&me).map(|p| p.medal.clone()).unwrap_or_default();
         let result = MatchResult { puuid: me, detail, rr, at };
@@ -1054,6 +1095,20 @@ async fn history_ids(
     ranked: &RankedHistory,
     patience: Duration,
 ) -> (Vec<String>, bool, Option<u64>, bool) {
+    let h = riot_history(riot, cache, puuid, competitive, window, patience).await;
+    merge_history(cache, puuid, competitive, window, h, ranked)
+}
+
+/// Pages match-history de Riot sur la période.
+struct RiotHistory {
+    found: HashMap<String, u64>,
+    reached_start: bool,
+    exhausted: bool,
+    busy: bool,
+    oldest: Option<u64>,
+}
+
+async fn riot_history(riot: &Riot, cache: &CareerCache, puuid: &str, competitive: bool, window: Option<&ActWindow>, patience: Duration) -> RiotHistory {
     let queue = if competitive { "&queue=competitive" } else { "" };
     let limit = if window.is_some() { MAX_MATCHES } else { FALLBACK_MATCHES };
     let mut found: HashMap<String, u64> = HashMap::new();
@@ -1105,7 +1160,13 @@ async fn history_ids(
             break;
         }
     }
+    RiotHistory { found, reached_start, exhausted, busy, oldest: riot_oldest }
+}
 
+/// Liste finale : historique Riot + archive locale + historique de rang et résumés HenrikDev.
+fn merge_history(cache: &CareerCache, puuid: &str, competitive: bool, window: Option<&ActWindow>, h: RiotHistory, ranked: &RankedHistory) -> (Vec<String>, bool, Option<u64>, bool) {
+    let limit = if window.is_some() { MAX_MATCHES } else { FALLBACK_MATCHES };
+    let RiotHistory { mut found, reached_start, exhausted, busy, oldest: riot_oldest } = h;
     // Archive locale : matchs plus anciens que ceux que Riot garde encore.
     let (local, local_oldest) = cache.known(puuid, window, competitive);
     for (id, t) in local {
@@ -1375,7 +1436,7 @@ pub async fn prefetch_players(
         }
         // 2. Détail de ces matchs chez Riot, à petit rythme, pendant la partie : la carrière d'un
         // joueur de la partie s'ouvre ensuite instantanément avec ses stats complètes.
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
         let mut round = 0;
         while round < PREFETCH_MATCHES {
             let mut any = false;
@@ -1390,7 +1451,7 @@ pub async fn prefetch_players(
                     continue;
                 }
                 let _ = match_cached(&riot, &cache, &q.id, "", false).await;
-                tokio::time::sleep(Duration::from_millis(900)).await;
+                tokio::time::sleep(Duration::from_millis(350)).await;
             }
             if !any {
                 break;
@@ -1482,6 +1543,7 @@ fn build(rows: &[(CareerMatch, PlayerStats)], s: &LoadState) -> Career {
         current_tier: s.current.map(|c| c.0),
         current_rr: s.current.map(|c| c.1),
         main_ready: s.main_ready || s.done,
+        pending: Vec::new(),
         partial: s.partial,
         failed: s.failed,
     }
@@ -1508,7 +1570,11 @@ async fn load(
     // Riot n'est attendu que quelques secondes : s'il limite les requêtes (pendant une partie,
     // l'overlay lit déjà les rangs des 10 joueurs), la carrière s'affiche avec le serveur relais et
     // l'archive locale, puis l'historique Riot est repris en fond et complète la liste.
-    let (ranked, (quick, quick_reached)) = tokio::join!(rr_changes(riot, cache, puuid, window.as_ref(), FALLBACK_MATCHES, FIRST_PASS), quick_fut);
+    let (ranked, (quick, quick_reached), riot_hist) = tokio::join!(
+        rr_changes(riot, cache, puuid, window.as_ref(), FALLBACK_MATCHES, FIRST_PASS),
+        quick_fut,
+        riot_history(riot, cache, puuid, competitive, window.as_ref(), FIRST_PASS)
+    );
     let quick_by_id: HashMap<&str, &QuickMatch> = quick.iter().map(|q| (q.id.as_str(), q)).collect();
     let with_quick = |mut ranked: RankedHistory| {
         for q in quick.iter() {
@@ -1519,7 +1585,7 @@ async fn load(
         ranked
     };
     let ranked = with_quick(ranked);
-    let (mut ids, limited, oldest, busy) = history_ids(riot, cache, puuid, competitive, window.as_ref(), &ranked, FIRST_PASS).await;
+    let (mut ids, limited, oldest, busy) = merge_history(cache, puuid, competitive, window.as_ref(), riot_hist, &ranked);
     let riot_busy = busy || ranked.busy;
     let mut rr = ranked.rr;
 
@@ -1594,6 +1660,9 @@ async fn load(
     if !riot.connected() {
         queue.truncate(OFFLINE_DETAILS);
     }
+    let queued = queue.clone();
+    let mut received: HashSet<String> = HashSet::new();
+    let mut last_progress = tokio::time::Instant::now();
     state.found = state.analyzed + queue.len() as u32;
     // Un match sur deux est demandé d'abord au relais : deux sources en parallèle, deux fois plus vite.
     let mut results = stream::iter(queue.into_iter().enumerate())
@@ -1613,7 +1682,12 @@ async fn load(
         emit(&build(&ordered(&ids, &rows), &state));
     }
     loop {
-        let limit = if state.main_ready { deadline } else { main_deadline.min(deadline) };
+        let mut limit = if state.main_ready { deadline } else { main_deadline.min(deadline) };
+        // Les derniers matchs traînent (Riot limite, quota du relais) : on n'attend plus qu'eux
+        // quand la majorité est prête ; ils finissent de se télécharger en arrière-plan.
+        if state.main_ready && received.len() * 10 >= queued.len() * 6 {
+            limit = limit.min(last_progress + DETAILS_STALL);
+        }
         let Ok(next) = tokio::time::timeout_at(limit, results.next()).await else {
             if !state.main_ready && tokio::time::Instant::now() < deadline {
                 state.main_ready = true;
@@ -1627,6 +1701,8 @@ async fn load(
         let Some((id, res)) = next else { break };
         state.analyzed += 1;
         missing.remove(&id);
+        received.insert(id.clone());
+        last_progress = tokio::time::Instant::now();
         match res {
             Ok(Some(parsed)) => match career_row(&id, &parsed, puuid, &rr, competitive) {
                 Some(mut row) => {
@@ -1655,7 +1731,9 @@ async fn load(
         }
     }
     state.done = true;
-    Ok(build(&ordered(&ids, &rows), &state))
+    let mut career = build(&ordered(&ids, &rows), &state);
+    career.pending = queued.into_iter().filter(|id| !received.contains(id)).collect();
+    Ok(career)
 }
 
 /// Stats principales d'un match reprises du résumé HenrikDev : elles sont affichées dès
@@ -2933,5 +3011,27 @@ mod tests {
             assert!(same * 10 >= checked * 7, "trop d'écarts");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Parties non classées / combat à mort : rang actuel connu à la place de « Non classé ».
+    #[test]
+    fn unrated_match_shows_current_rank() {
+        let people = Directory::new(None);
+        people.remember(Known { puuid: "a".into(), name: "Nova".into(), tier: 21, ..Default::default() });
+        let shared = Shared::default();
+        let mut m = ParsedMatch { queue_id: "deathmatch".into(), ..Default::default() };
+        for id in ["a", "b"] {
+            m.players.insert(id.into(), PlayerStats { team: "Blue".into(), ..Default::default() });
+        }
+        m.teams.insert("Blue".into(), (true, 1));
+        let mut d = detail("x", &m, None);
+        fill_tiers(&mut d, &shared, &people);
+        let tier = |d: &MatchDetail, id: &str| d.teams[0].players.iter().find(|p| p.puuid == id).unwrap().tier;
+        assert_eq!((tier(&d, "a"), tier(&d, "b")), (21, 0));
+        // En compétition, 0 = placements : on garde « Non classé »
+        m.queue_id = "competitive".into();
+        let mut d = detail("x", &m, None);
+        fill_tiers(&mut d, &shared, &people);
+        assert_eq!(tier(&d, "a"), 0);
     }
 }

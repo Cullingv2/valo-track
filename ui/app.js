@@ -624,7 +624,9 @@ function careerPerfHead(c, d) {
     let count = expected && s.matches < expected
       ? `${s.matches} partie${s.matches > 1 ? "s" : ""} analysée${s.matches > 1 ? "s" : ""} sur ${expected} dans l'acte (données officielles), ${s.rounds} manches`
       : `${plural(s.matches, "match")} analysé${s.matches > 1 ? "s" : ""}, ${s.rounds} manches`;
-    const note = "";
+    // Détail pas encore téléchargé pour tous les matchs (il continue en arrière-plan)
+    const adv = s.advancedMatches ?? s.matches;
+    const note = d.done && adv > 0 && adv < s.matches ? ` · stats détaillées sur les ${adv} plus récents` : "";
     if (expected && s.matches >= expected) count += " · acte complet";
     const modes = c.competitive ? "" : " · hors match à mort, Escalade et parties personnalisées";
     info = `<p>${esc(count + modes + note)}</p>`;

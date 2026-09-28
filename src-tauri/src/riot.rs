@@ -273,7 +273,8 @@ impl Riot {
         loop {
             match self.pd(path).await {
                 Err(e) if (e.is::<RateLimited>() || self.stale.load(Ordering::Relaxed)) && started.elapsed() < max => {
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    // Jamais au-delà de `max` : dernier essai pile à l'échéance
+                    tokio::time::sleep(Duration::from_secs(delay).min(max.saturating_sub(started.elapsed()))).await;
                     delay = (delay * 2).min(30);
                 }
                 r => return r,

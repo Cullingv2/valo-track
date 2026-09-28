@@ -4,6 +4,7 @@
 use crate::directory::{Directory, Known};
 use crate::henrik::Henrik;
 use crate::riot::{Conn, RateLimited, Riot};
+use futures_util::{stream, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -128,6 +129,8 @@ pub struct Shared {
     content: Mutex<Content>,
     /// Groupes probables de la partie en cours (voir `career::spawn_party_hints`)
     hints: Mutex<PartyHints>,
+    /// Rangs actuels vus pendant la session (joueurs incognito compris)
+    tiers: Mutex<HashMap<String, u32>>,
 }
 
 /// Pour chaque joueur de la partie : ses coéquipiers de groupe lors de son dernier match.
@@ -149,6 +152,11 @@ struct Content {
 impl Shared {
     pub fn phase(&self) -> Phase {
         self.snapshot.lock().unwrap().phase
+    }
+
+    /// Rang actuel d'un joueur vu pendant la session (0 = inconnu ou non classé).
+    pub fn live_tier(&self, puuid: &str) -> u32 {
+        self.tiers.lock().unwrap().get(puuid).copied().unwrap_or(0)
     }
 
     /// Résultat pour un joueur (ignoré si la partie a changé entre-temps).
@@ -844,13 +852,23 @@ impl Tracker {
         snap.players = raws.iter().map(|r| self.view(r, &me, &my_team, &groups, &guessed)).collect();
         self.publish(snap.clone());
 
-        // Rangs, un par un pour ménager la limite de requêtes ; l'interface se remplit au fur et à mesure.
+        // Rangs, 3 à la fois (au lieu d'un par un) ; l'interface se remplit au fur et à mesure.
         if self.backoff_until.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let todo: Vec<String> = raws.iter().map(|r| r.puuid.clone()).filter(|p| self.rank_stale(p)).collect();
-        for puuid in todo {
-            let rank = match self.fetch_rank(&puuid).await {
+        let ctx = RankCtx { riot: self.riot.clone(), app: self.app.clone(), current: self.current_act.clone(), acts: Arc::new(self.acts.clone()) };
+        let mut ranks = stream::iter(todo)
+            .map(|puuid| {
+                let ctx = ctx.clone();
+                async move {
+                    let r = ctx.fetch(&puuid).await;
+                    (puuid, r)
+                }
+            })
+            .buffer_unordered(3);
+        while let Some((puuid, res)) = ranks.next().await {
+            let rank = match res {
                 Ok(r) => r,
                 Err(e) if e.is::<RateLimited>() => {
                     self.backoff_until = Some(Instant::now() + Duration::from_secs(20));
@@ -861,12 +879,14 @@ impl Tracker {
                     RankInfo { error: true, ..Default::default() }
                 }
             };
+            if rank.tier > 0 {
+                self.shared.tiers.lock().unwrap().insert(puuid.clone(), rank.tier);
+            }
             self.ranks.insert(puuid.clone(), (Instant::now(), rank.clone()));
             if let Some(p) = snap.players.iter_mut().find(|p| p.puuid == puuid) {
                 p.rank = Some(rank);
             }
             self.publish(snap.clone());
-            tokio::time::sleep(Duration::from_millis(120)).await;
         }
     }
 
@@ -952,24 +972,36 @@ impl Tracker {
         (groups, guessed)
     }
 
-    async fn fetch_rank(&mut self, puuid: &str) -> anyhow::Result<RankInfo> {
+}
+
+/// De quoi lire des rangs en parallèle, sans bloquer la boucle de suivi.
+#[derive(Clone)]
+struct RankCtx {
+    riot: Arc<Riot>,
+    app: AppHandle,
+    current: Option<String>,
+    acts: Arc<HashMap<String, Act>>,
+}
+
+impl RankCtx {
+    async fn fetch(&self, puuid: &str) -> anyhow::Result<RankInfo> {
         match self.riot.pd(&format!("/mmr/v1/players/{puuid}")).await {
-            Ok(Some(v)) => Ok(parse_mmr(&v, self.current_act.as_deref(), &self.acts)),
+            Ok(Some(v)) => Ok(parse_mmr(&v, self.current.as_deref(), &self.acts)),
             Ok(None) => Err(anyhow::anyhow!("profil compétitif introuvable")),
             // Riot limite : même rang via le relais HenrikDev (sans attendre son quota)
-            Err(e) if e.is::<RateLimited>() => self.relay_rank(puuid).await.ok_or(e),
+            Err(e) if e.is::<RateLimited>() => self.relay(puuid).await.ok_or(e),
             Err(e) => Err(e),
         }
     }
 
-    async fn relay_rank(&self, puuid: &str) -> Option<RankInfo> {
+    async fn relay(&self, puuid: &str) -> Option<RankInfo> {
         let henrik = self.app.state::<Arc<Henrik>>();
         if !henrik.available() {
             return None;
         }
         let region = self.app.state::<Arc<Directory>>().region_for(puuid, &self.riot.region());
         let v = henrik.try_get(&format!("valorant/v3/by-puuid/mmr/{region}/pc/{puuid}")).await?;
-        Some(henrik_rank(&v["data"], self.current_act.as_deref(), &self.acts).rank)
+        Some(henrik_rank(&v["data"], self.current.as_deref(), &self.acts).rank)
     }
 }
 
